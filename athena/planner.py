@@ -22,6 +22,8 @@ class Planner:
         advisory_risks = [int((e.attributes or {}).get("risk", 0) or 0) for e in graph.entities.values() if e.kind == "advisory"]
         max_advisory_risk = max(advisory_risks, default=0)
         advisory_count = len(advisory_risks)
+        lifecycle = self._lifecycle_tasks(findings)
+        tasks.extend(lifecycle)
         if objective:
             text = objective.text.lower() if isinstance(objective, Objective) else str(objective).lower()
             objective_text = objective.text if isinstance(objective, Objective) else str(objective)
@@ -75,3 +77,22 @@ class Planner:
             if existing is None or task.priority > existing.priority:
                 deduped[task.kind] = task
         return sorted(deduped.values(), key=lambda task: task.priority, reverse=True)
+
+    @staticmethod
+    def _lifecycle_tasks(findings: list[dict]) -> list[InvestigationTask]:
+        """Elevate regression and deterioration while reducing redundant recurring work."""
+        states: dict[str, int] = {}
+        for record in findings:
+            lifecycle = record.get("lifecycle") or {}
+            state = str(lifecycle.get("state", "new")).lower()
+            states[state] = states.get(state, 0) + 1
+        tasks: list[InvestigationTask] = []
+        if states.get("worsening"):
+            tasks.append(InvestigationTask("finding_triage", f"{states['worsening']} finding(s) are worsening; investigate before routine assurance work.", 135))
+        if states.get("reopened"):
+            tasks.append(InvestigationTask("finding_triage", f"{states['reopened']} finding(s) reopened after resolution; prioritize regression investigation.", 134))
+        if states.get("new"):
+            tasks.append(InvestigationTask("finding_triage", f"{states['new']} new finding(s) require initial evidence triage.", 128))
+        if states.get("recurring"):
+            tasks.append(InvestigationTask("finding_triage", f"{states['recurring']} recurring finding(s) should be monitored without duplicating unchanged investigation.", 103))
+        return tasks
