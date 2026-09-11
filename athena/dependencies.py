@@ -19,6 +19,22 @@ class Dependency:
 
 
 @dataclass(frozen=True, slots=True)
+class Advisory:
+    ecosystem: str
+    package: str
+    severity: str
+    vulnerable_range: str | None
+    fixed_version: str | None
+    identifiers: tuple[str, ...]
+    source: str
+
+    def to_dict(self) -> dict:
+        data = asdict(self)
+        data["identifiers"] = list(self.identifiers)
+        return data
+
+
+@dataclass(frozen=True, slots=True)
 class AuditResult:
     tool: str
     available: bool
@@ -31,7 +47,7 @@ class AuditResult:
 
 
 class DependencyAnalyzer:
-    """Read dependency manifests and optionally run installed open-source auditors."""
+    """Read manifests and normalize optional open-source supply-chain advisories."""
 
     def inventory(self, root: str | Path) -> list[Dependency]:
         root = Path(root).resolve()
@@ -44,10 +60,7 @@ class DependencyAnalyzer:
 
     def audit(self, root: str | Path, ecosystem: str) -> AuditResult:
         root = Path(root).resolve()
-        commands = {
-            "python": ["python", "-m", "pip_audit", "-f", "json"],
-            "node": ["npm", "audit", "--json"],
-        }
+        commands = {"python": ["python", "-m", "pip_audit", "-f", "json"], "node": ["npm", "audit", "--json"]}
         command = commands.get(ecosystem)
         if command is None:
             return AuditResult(ecosystem, False, None, [], "No built-in auditor for this ecosystem.")
@@ -58,6 +71,40 @@ class DependencyAnalyzer:
         output = completed.stdout or completed.stderr
         findings = self._parse_audit(output, ecosystem)
         return AuditResult(command[0], True, completed.returncode, findings, output[:12000])
+
+    def advisories(self, root: str | Path, ecosystem: str) -> list[Advisory]:
+        """Run an installed auditor and convert results into stable advisory records."""
+        result = self.audit(root, ecosystem)
+        return self.normalize_advisories(result.findings, ecosystem, result.tool)
+
+    @staticmethod
+    def normalize_advisories(findings: list[dict], ecosystem: str, source: str) -> list[Advisory]:
+        advisories: list[Advisory] = []
+        for item in findings:
+            package = str(item.get("package") or item.get("name") or item.get("dependency", ""))
+            if not package:
+                continue
+            ids = item.get("ids") or item.get("id") or item.get("identifiers") or item.get("via") or []
+            if isinstance(ids, str):
+                ids = [ids]
+            if not isinstance(ids, (list, tuple)):
+                ids = [str(ids)]
+            severity = str(item.get("severity") or item.get("fix_versions") and "high" or "unknown").lower()
+            vulnerable = item.get("vulnerable_versions") or item.get("vulnerable_range") or item.get("range")
+            fixed = item.get("fixed_version")
+            if fixed is None:
+                fixes = item.get("fix_versions")
+                if isinstance(fixes, list) and fixes:
+                    first = fixes[0]
+                    fixed = first.get("version") if isinstance(first, dict) else first
+            advisories.append(Advisory(ecosystem, package, severity, str(vulnerable) if vulnerable else None, str(fixed) if fixed else None, tuple(sorted({str(i) for i in ids})), source))
+        return advisories
+
+    @staticmethod
+    def advisory_risk(advisory: Advisory) -> int:
+        """Transparent 0-100 supply-chain risk contribution; not a vulnerability score."""
+        weights = {"critical": 100, "high": 80, "moderate": 55, "medium": 55, "low": 25, "unknown": 40}
+        return weights.get(advisory.severity, 40)
 
     def _requirements(self, path: Path) -> list[Dependency]:
         if not path.exists():
