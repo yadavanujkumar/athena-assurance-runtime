@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import asdict
-from pathlib import Path
 import ast
 import hashlib
 import json
+from dataclasses import asdict
+from pathlib import Path
 
 from .models import Entity, Relationship
 
@@ -70,20 +70,70 @@ class KnowledgeGraph:
         root = root.resolve()
         project = self.upsert_entity("project", str(root), name=root.name, path=str(root))
         ignored = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", ".athena"}
+        current_files: set[str] = set()
+        current_symbols: set[str] = set()
         for path in root.rglob("*"):
             if any(part in ignored for part in path.parts) or not path.is_file():
                 continue
+            rel = str(path.relative_to(root))
+            current_files.add(rel)
             kind = "python_file" if path.suffix == ".py" else "file"
-            entity = self.upsert_entity(kind, str(path), name=path.name, path=str(path.relative_to(root)))
+            entity = self.upsert_entity(kind, str(path), name=path.name, path=rel)
             self.add_relationship(Relationship(project.id, "contains", entity.id))
             if path.suffix == ".py":
-                self._discover_python(path, entity.id)
+                current_symbols.update(self._discover_python(path, entity.id))
+        self.reconcile_project(root, current_files=current_files, current_symbols=current_symbols)
 
-    def _discover_python(self, path: Path, file_id: str) -> None:
+    def reconcile_project(self, root: Path, *, current_files: set[str] | None = None, current_symbols: set[str] | None = None) -> list[str]:
+        """Remove stale file/symbol nodes and every edge attached to them."""
+        root = root.resolve()
+        current_files = current_files if current_files is not None else self._current_files(root)
+        current_symbols = current_symbols if current_symbols is not None else self._current_symbols(root)
+        stale: set[str] = set()
+        for entity in self.entities.values():
+            if entity.kind not in {"file", "python_file", "symbol"}:
+                continue
+            if entity.kind in {"file", "python_file"}:
+                if entity.path not in current_files:
+                    stale.add(entity.id)
+            elif entity.path:
+                rel = Path(entity.path).resolve().relative_to(root) if Path(entity.path).is_absolute() else Path(entity.path)
+                if f"{rel.as_posix()}:{entity.name}" not in current_symbols:
+                    stale.add(entity.id)
+        if not stale:
+            return []
+        removed = [entity.id for entity in self.entities.values() if entity.id in stale]
+        for entity_id in stale:
+            self.entities.pop(entity_id, None)
+        self.relationships = [r for r in self.relationships if r.source not in stale and r.target not in stale]
+        return removed
+
+    @staticmethod
+    def _current_files(root: Path) -> set[str]:
+        ignored = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", ".athena"}
+        return {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() and not any(part in ignored for part in p.parts)}
+
+    @staticmethod
+    def _current_symbols(root: Path) -> set[str]:
+        symbols: set[str] = set()
+        ignored = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", ".athena"}
+        for path in root.rglob("*.py"):
+            if any(part in ignored for part in path.parts):
+                continue
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            except (OSError, UnicodeDecodeError, SyntaxError):
+                continue
+            rel = path.relative_to(root).as_posix()
+            symbols.update(f"{rel}:{node.name}" for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)))
+        return symbols
+
+    def _discover_python(self, path: Path, file_id: str) -> set[str]:
+        discovered: set[str] = set()
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         except (OSError, UnicodeDecodeError, SyntaxError):
-            return
+            return discovered
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
@@ -93,8 +143,10 @@ class KnowledgeGraph:
                 dep = self.upsert_entity("module", node.module)
                 self.add_relationship(Relationship(file_id, "imports", dep.id))
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                discovered.add(f"{path.as_posix()}:{node.name}".replace(path.as_posix(), path.as_posix()))
                 symbol = self.upsert_entity("symbol", f"{path}:{node.name}", name=node.name, path=str(path))
                 self.add_relationship(Relationship(file_id, "defines", symbol.id))
+        return discovered
 
     def to_dict(self) -> dict:
         return {"entities": [asdict(e) for e in self.entities.values()], "relationships": [asdict(r) for r in self.relationships]}
