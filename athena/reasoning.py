@@ -27,6 +27,8 @@ class AssuranceReasoning:
     recommended_investigations: list[str]
     why_now: list[str]
     confidence: float
+    supply_chain_risk: int = 0
+    affected_advisories: list[dict] | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -41,16 +43,41 @@ class ReasoningEngine:
         self.governance = governance or GovernanceCatalog()
         self.lifecycle = FindingLifecycle(memory)
 
+    @staticmethod
+    def _supply_chain_context(entities: list[dict], relationships: list[dict]) -> tuple[int, list[dict]]:
+        """Return the strongest connected advisory risk and its advisory records."""
+        dependency_ids = {e["id"] for e in entities if e.get("kind") == "dependency"}
+        advisory_by_id = {e["id"]: e for e in entities if e.get("kind") == "advisory"}
+        connected: list[dict] = []
+        for edge in relationships:
+            if edge.get("relation") != "affected_by" or edge.get("source") not in dependency_ids:
+                continue
+            advisory = advisory_by_id.get(edge.get("target"))
+            if advisory:
+                attrs = advisory.get("attributes") or {}
+                connected.append({
+                    "id": advisory["id"],
+                    "name": advisory.get("name", "advisory"),
+                    "package": attrs.get("package", ""),
+                    "severity": attrs.get("severity", "unknown"),
+                    "risk": int(attrs.get("risk", 0) or 0),
+                    "identifiers": list(attrs.get("identifiers", []) or []),
+                })
+        connected.sort(key=lambda item: (-item["risk"], item["package"], item["name"]))
+        return (max((item["risk"] for item in connected), default=0), connected)
+
     def reason(self, finding: Finding, graph, *, change_classes: set[str] | None = None) -> AssuranceReasoning:
         risk = self.risk.score(finding)
         context = graph.context_for_finding(finding.id, depth=2)
         entities = context.get("entities", [])
         relationships = context.get("relationships", [])
         entity_by_id = {e["id"]: e for e in entities}
+        supply_risk, advisories = self._supply_chain_context(entities, relationships)
+        adjusted_score = self.risk.with_supply_chain(risk, supply_risk)
 
         affected = [
             e for e in entities
-            if e.get("kind") in {"file", "python_file", "dependency", "ai_provider", "ai_model", "ai_prompt", "ai_tool", "ai_network_boundary", "ai_execution_boundary"}
+            if e.get("kind") in {"file", "python_file", "dependency", "advisory", "ai_provider", "ai_model", "ai_prompt", "ai_tool", "ai_network_boundary", "ai_execution_boundary"}
         ]
         affected.sort(key=lambda e: (e.get("kind", ""), e.get("path") or "", e.get("name", "")))
 
@@ -68,6 +95,8 @@ class ReasoningEngine:
             risk_factors.append("The finding has direct detector evidence.")
         else:
             risk_factors.append("The finding has no direct detector evidence; risk is discounted by the risk engine.")
+        if supply_risk:
+            risk_factors.append(f"Connected supply-chain advisory risk is {supply_risk}/100.")
         if any(e.get("kind", "").startswith("ai_") for e in affected):
             risk_factors.append("The finding is connected to an AI trust-boundary component.")
         if any(e.get("kind") == "dependency" for e in affected):
@@ -97,26 +126,28 @@ class ReasoningEngine:
             why_now.append("Recent project drift exists in durable memory.")
         if state and state.get("status") == "reopened":
             why_now.append("This finding was previously resolved and has reappeared.")
+        if supply_risk:
+            why_now.append("A connected dependency has active advisory exposure requiring supply-chain review.")
         if not why_now:
             why_now.append("The finding is part of the current assurance cycle.")
 
         recommendations: list[str] = []
         if not affected:
             recommendations.append("Investigate the finding source and establish a graph link to the affected component.")
-        if any(e.get("kind") == "dependency" for e in affected):
-            recommendations.append("Inspect the dependency manifest and available advisory evidence before changing versions.")
+        if any(e.get("kind") == "dependency" for e in affected) or supply_risk:
+            recommendations.append("Inspect the dependency manifest and advisory evidence before changing versions.")
         if any(e.get("kind", "").startswith("ai_") for e in affected):
             recommendations.append("Trace the connected AI provider, model, prompt, tool and execution/network boundaries.")
-        if finding.severity.value in {"high", "critical"}:
+        if finding.severity.value in {"high", "critical"} or supply_risk >= 80:
             recommendations.append("Run focused validation and preserve evidence before any write action.")
         if not recommendations:
             recommendations.append("Run targeted validation against the affected component and update the finding with new evidence.")
 
         return AssuranceReasoning(
             finding_id=finding.id,
-            risk_score=risk.score,
-            risk_band=risk.band,
-            risk_rationale=risk.rationale,
+            risk_score=adjusted_score.score,
+            risk_band=adjusted_score.band,
+            risk_rationale=adjusted_score.rationale,
             affected_components=affected,
             impact_path=paths,
             supporting_evidence=supporting,
@@ -128,4 +159,6 @@ class ReasoningEngine:
             recommended_investigations=list(dict.fromkeys(recommendations)),
             why_now=list(dict.fromkeys(why_now)),
             confidence=round(min(1.0, max(0.0, finding.confidence)), 2),
+            supply_chain_risk=supply_risk,
+            affected_advisories=advisories,
         )
