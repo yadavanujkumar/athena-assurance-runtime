@@ -16,33 +16,36 @@ class AssuranceEngine:
         self.governance = GovernanceCatalog()
         self.remediation = RemediationPlanner()
 
-    def assess(self, findings: list[Finding]) -> list[Decision]:
+    def assess(self, findings: list[Finding], reasoning: dict[str, dict] | None = None) -> list[Decision]:
         decisions: list[Decision] = []
+        reasoning = reasoning or {}
         for finding in findings:
             action = self.policy.next_action(finding)
             approved = action in {Action.OBSERVE, Action.INVESTIGATE, Action.RECOMMEND}
             if finding.severity is Severity.CRITICAL and not self.policy.authority.block:
                 approved = False
-            rationale = self._rationale(finding, action, approved)
+            rationale = self._rationale(finding, action, reasoning.get(finding.id))
             decision_id = "D-" + hashlib.sha256(f"{finding.id}:{action.value}".encode()).hexdigest()[:12].upper()
             decision = Decision(decision_id, finding.id, action, approved, rationale, utc_now())
             self.memory.add_decision(decision)
             controls = self.governance.map_finding(finding)
-            plan = [
-                {"action": step.action, "rationale": step.rationale, "requires_approval": step.requires_approval}
-                for step in self.remediation.plan(finding, action)
-            ]
+            plan = [{"action": step.action, "rationale": step.rationale, "requires_approval": step.requires_approval} for step in self.remediation.plan(finding, action)]
             self.memory.remember("governance_mapping", {"finding_id": finding.id, "controls": controls})
             self.memory.remember("remediation_plan", {"finding_id": finding.id, "decision_id": decision.id, "steps": plan})
             decisions.append(decision)
         return decisions
 
     @staticmethod
-    def _rationale(finding: Finding, action: Action, approved: bool) -> str:
+    def _rationale(finding: Finding, action: Action, context: dict | None) -> str:
+        prefix = ""
+        if context:
+            prefix = f"Graph context identifies {len(context.get('affected_components', []))} affected component(s) with risk band {context.get('risk_band', 'unknown')}. "
+            if context.get("uncertainties"):
+                prefix += "Uncertainty remains, so validation is required. "
         if action is Action.MODIFY:
-            return "Modification authority is enabled; execution must still pass validation gates."
+            return prefix + "Modification authority is enabled; execution must still pass validation gates."
         if action is Action.BLOCK:
-            return "Critical risk meets the configured blocking threshold."
+            return prefix + "Critical risk meets the configured blocking threshold."
         if finding.severity in {Severity.HIGH, Severity.CRITICAL}:
-            return "High-impact risk is surfaced for human-controlled remediation."
-        return "Low-impact finding can be investigated and recommended without write authority."
+            return prefix + "High-impact risk is surfaced for human-controlled remediation."
+        return prefix + "Low-impact finding can be investigated and recommended without write authority."
