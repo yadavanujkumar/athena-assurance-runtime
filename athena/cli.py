@@ -20,11 +20,31 @@ def build_parser() -> argparse.ArgumentParser:
     cycle = sub.add_parser("run")
     cycle.add_argument("path", nargs="?", default=".")
     cycle.add_argument("--objective", help="Explicit assurance objective")
+    cycle.add_argument("--yes", action="store_true", help="Accept ATHENA's baseline objective without prompting")
     watch = sub.add_parser("watch")
     watch.add_argument("path", nargs="?", default=".")
     watch.add_argument("--interval", type=float, default=5.0)
     watch.add_argument("--once", action="store_true")
     return parser
+
+
+def choose_objective(runtime: AthenaRuntime) -> str | None:
+    """Ask for agreement when ATHENA has no explicit user objective."""
+    runtime.initialize()
+    tasks = runtime.autonomous_plan()
+    proposals = [task for task in tasks if task.kind != "scope_objective"][:3]
+    print("ATHENA inspected the project and proposes these assurance priorities:")
+    for index, task in enumerate(proposals, 1):
+        print(f"  {index}. {task.reason}")
+    print("  r. Redefine the objective")
+    print("  b. Continue with ATHENA's baseline")
+    choice = input("Choose [1-3/r/b]: ").strip().lower()
+    if choice == "r":
+        text = input("Enter the assurance objective: ").strip()
+        return text or None
+    if choice in {"1", "2", "3"} and int(choice) <= len(proposals):
+        return proposals[int(choice) - 1].reason
+    return "Establish an autonomous assurance baseline across the project."
 
 
 def main(argv=None) -> int:
@@ -46,7 +66,10 @@ def main(argv=None) -> int:
         elif args.command == "plan":
             print(json.dumps([{"kind": t.kind, "reason": t.reason, "priority": t.priority} for t in runtime.autonomous_plan()], indent=2))
         elif args.command == "run":
-            print(json.dumps(runtime.run_autonomous_cycle(args.objective), indent=2))
+            objective = args.objective
+            if objective is None and not args.yes:
+                objective = choose_objective(runtime)
+            print(json.dumps(runtime.run_autonomous_cycle(objective), indent=2))
         elif args.command == "watch":
             def changed(fingerprint):
                 runtime.memory.remember("project_changed", {"fingerprint": fingerprint})
