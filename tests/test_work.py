@@ -70,3 +70,20 @@ def test_blocked_work_unblocks_when_dependencies_complete(tmp_path: Path) -> Non
     ready = queue.unblock_ready()
     assert [item.id for item in ready] == [child.id]
     assert queue.get(child.id).status == "queued"
+
+
+def test_stale_advisory_work_is_cancelled(tmp_path: Path) -> None:
+    queue = make_queue(tmp_path)
+    active = queue.enqueue(kind="dependency_advisory_review", reason="Review CVE-1", priority=125, context_key="advisory:A1")
+    stale = queue.enqueue(kind="dependency_advisory_review", reason="Review CVE-2", priority=125, context_key="advisory:A2")
+
+    cancelled = queue.cancel_stale_contexts(
+        kind="dependency_advisory_review",
+        context_prefix="advisory:",
+        active_contexts={"advisory:A1"},
+        reason="Advisory resolved",
+    )
+
+    assert [item.id for item in cancelled] == [stale.id]
+    assert queue.get(active.id).status == "queued"
+    assert queue.get(stale.id).status == "cancelled"
