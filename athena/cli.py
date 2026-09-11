@@ -5,6 +5,7 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
+from .health import check_runtime
 from .runtime import AthenaRuntime
 from .watch import ProjectWatcher
 
@@ -12,7 +13,7 @@ from .watch import ProjectWatcher
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="athena", description="ATHENA autonomous assurance runtime")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("init", "inspect", "status", "findings", "plan"):
+    for name in ("init", "inspect", "status", "findings", "plan", "health"):
         cmd = sub.add_parser(name)
         cmd.add_argument("path", nargs="?", default=".")
     work = sub.add_parser("work")
@@ -37,7 +38,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def choose_objective(runtime: AthenaRuntime) -> str | None:
-    """Ask for agreement when ATHENA has no explicit user objective."""
     runtime.initialize()
     tasks = runtime.autonomous_plan()
     proposals = [task for task in tasks if task.kind != "scope_objective"][:3]
@@ -66,6 +66,9 @@ def main(argv=None) -> int:
             print(json.dumps([asdict(f) for f in runtime.inspect()], indent=2))
         elif args.command == "status":
             print(json.dumps(runtime.status(), indent=2))
+        elif args.command == "health":
+            runtime.initialize()
+            print(json.dumps(asdict(check_runtime(runtime.root, runtime.memory.db, runtime.graph_path)), indent=2))
         elif args.command == "findings":
             print(json.dumps(runtime.memory.findings(), indent=2))
         elif args.command == "work":
@@ -87,7 +90,6 @@ def main(argv=None) -> int:
                 runtime.memory.remember("project_changed", {"fingerprint": fingerprint})
                 print(f"Change detected: {fingerprint}")
                 print(json.dumps(runtime.run_autonomous_cycle(), indent=2))
-
             runtime.initialize()
             ProjectWatcher(runtime.root, args.interval).run(changed, args.once)
         return 0
