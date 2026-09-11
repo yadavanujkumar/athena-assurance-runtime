@@ -5,7 +5,7 @@ from .models import Relationship
 
 
 class DependencyGraphBuilder:
-    """Projects dependency inventory into the living assurance graph."""
+    """Projects dependency inventory and advisory risk into the living assurance graph."""
 
     def __init__(self, analyzer: DependencyAnalyzer | None = None) -> None:
         self.analyzer = analyzer or DependencyAnalyzer()
@@ -27,3 +27,20 @@ class DependencyGraphBuilder:
                     graph.add_relationship(Relationship(project.id, "declares_dependency", entity.id))
             created.append({"id": entity.id, "kind": entity.kind, "name": entity.name, "ecosystem": dependency.ecosystem, "version": dependency.version, "source": dependency.source})
         return created
+
+    def add_advisories(self, graph, root, ecosystem: str) -> list[dict]:
+        """Attach normalized audit advisories to dependency nodes without installing anything."""
+        results: list[dict] = []
+        for advisory in self.analyzer.advisories(root, ecosystem):
+            dependency = graph.upsert_entity(
+                "dependency", f"{advisory.ecosystem}:{advisory.package}",
+                name=advisory.package, attributes={"ecosystem": advisory.ecosystem},
+            )
+            key = f"{advisory.ecosystem}:{advisory.package}:{','.join(advisory.identifiers)}:{advisory.vulnerable_range or ''}"
+            entity = graph.upsert_entity(
+                "advisory", key, name=advisory.identifiers[0] if advisory.identifiers else f"{advisory.package} advisory",
+                attributes={**advisory.to_dict(), "risk": self.analyzer.advisory_risk(advisory)},
+            )
+            graph.add_relationship(Relationship(dependency.id, "affected_by", entity.id))
+            results.append({"dependency_id": dependency.id, "advisory_id": entity.id, **advisory.to_dict(), "risk": self.analyzer.advisory_risk(advisory)})
+        return results
