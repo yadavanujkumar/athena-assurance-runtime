@@ -32,9 +32,15 @@ class DependencyGraphBuilder:
         """Attach normalized audit advisories to dependency nodes without installing anything."""
         results: list[dict] = []
         for advisory in self.analyzer.advisories(root, ecosystem):
+            dependency_id = f"{advisory.ecosystem}:{advisory.package}"
+            existing = graph.entities.get(graph.stable_id("dependency", dependency_id))
+            attributes = dict(existing.attributes) if existing else {}
+            attributes.update({"ecosystem": advisory.ecosystem, "name": advisory.package})
             dependency = graph.upsert_entity(
-                "dependency", f"{advisory.ecosystem}:{advisory.package}",
-                name=advisory.package, attributes={"ecosystem": advisory.ecosystem},
+                "dependency", dependency_id,
+                name=existing.name if existing else advisory.package,
+                path=existing.path if existing else None,
+                attributes=attributes,
             )
             key = f"{advisory.ecosystem}:{advisory.package}:{','.join(advisory.identifiers)}:{advisory.vulnerable_range or ''}"
             entity = graph.upsert_entity(
