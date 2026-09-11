@@ -121,3 +121,7 @@ class InvestigationEngine:
         if "test" in text or "validat" in text:
             return "validation"
         return "security_review"
+
+
+# Compatibility facade retained for runtime integrations and older callers.
+Investigator = InvestigationEngine
