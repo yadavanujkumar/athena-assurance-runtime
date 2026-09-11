@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 from .runtime import AthenaRuntime
@@ -62,7 +63,7 @@ def main(argv=None) -> int:
             runtime.initialize()
             print(f"ATHENA initialized: {runtime.root}")
         elif args.command == "inspect":
-            print(json.dumps(runtime.inspect(), indent=2))
+            print(json.dumps([asdict(f) for f in runtime.inspect()], indent=2))
         elif args.command == "status":
             print(json.dumps(runtime.status(), indent=2))
         elif args.command == "findings":
