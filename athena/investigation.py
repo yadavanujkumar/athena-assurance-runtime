@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 import hashlib
+import re
 
 from .dependencies import DependencyAnalyzer
 from .detectors import default_detectors
@@ -47,12 +48,16 @@ class InvestigationEngine:
             deps = self.dependencies.inventory(self.root)
             evidence.extend(Evidence(d.source, "dependency", f"{d.ecosystem}:{d.name}@{d.version or 'unversioned'}") for d in deps)
             self.memory.fact("dependencies.inventory", [d.to_dict() for d in deps])
-            for ecosystem in sorted({d.ecosystem for d in deps}):
+            target = self._advisory_target(objective) if kind == "dependency_advisory_review" else None
+            ecosystems = [target[0]] if target else sorted({d.ecosystem for d in deps})
+            for ecosystem in ecosystems:
                 audit = self.dependencies.audit(self.root, ecosystem)
                 evidence.append(Evidence(audit.tool, "audit", f"available={audit.available}; exit_code={audit.exit_code}; advisories={len(audit.findings)}"))
                 self.memory.remember("dependency_audit", audit.to_dict())
                 for advisory in audit.findings:
                     name = advisory.get("name") or advisory.get("package") or "dependency"
+                    if target and name.lower() != target[1].lower():
+                        continue
                     identifiers = advisory.get("identifiers") or advisory.get("id") or advisory.get("cve") or []
                     if isinstance(identifiers, str):
                         identifiers = [identifiers]
@@ -87,6 +92,13 @@ class InvestigationEngine:
             self.memory.remember("evidence_correlation", {"states": lifecycle, "evidence_count": len(evidence)})
         self.memory.remember("investigation_completed", {"objective": objective, "task_kind": kind, "finding_count": len(findings), "critical_count": sum(f.severity is Severity.CRITICAL for f in findings), "high_count": sum(f.severity is Severity.HIGH for f in findings), "evidence_count": len(evidence)})
         return InvestigationResult(objective, findings, evidence)
+
+    @staticmethod
+    def _advisory_target(objective: str) -> tuple[str, str] | None:
+        match = re.search(r"active\s+(python|node)\s+advisory\s+for\s+([^;]+)", objective, re.IGNORECASE)
+        if not match:
+            return None
+        return match.group(1).lower(), match.group(2).strip()
 
     @staticmethod
     def _advisory_severity(value) -> Severity:
