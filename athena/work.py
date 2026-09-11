@@ -26,11 +26,17 @@ class WorkItem:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.id, "kind": self.kind, "reason": self.reason,
-            "objective": self.objective, "priority": self.priority,
-            "status": self.status, "attempts": self.attempts,
-            "created_at": self.created_at, "updated_at": self.updated_at,
-            "last_error": self.last_error, "depends_on": list(self.depends_on),
+            "id": self.id,
+            "kind": self.kind,
+            "reason": self.reason,
+            "objective": self.objective,
+            "priority": self.priority,
+            "status": self.status,
+            "attempts": self.attempts,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "last_error": self.last_error,
+            "depends_on": list(self.depends_on),
             "context_key": self.context_key,
         }
 
@@ -38,9 +44,12 @@ class WorkItem:
 class WorkQueue:
     """Durable, deterministic work state backed by the runtime SQLite connection."""
 
+    ACTIVE = {"queued", "running", "blocked"}
+
     def __init__(self, db: sqlite3.Connection) -> None:
         self.db = db
         self._init()
+        self.recover_running()
 
     def _init(self) -> None:
         self.db.executescript(
@@ -63,22 +72,32 @@ class WorkQueue:
         raw = json.dumps([kind, reason, objective, context_key], sort_keys=True)
         return "W-" + hashlib.sha256(raw.encode()).hexdigest()[:12].upper()
 
-    def enqueue(self, *, kind: str, reason: str, priority: int,
-                objective: str | None = None, depends_on: tuple[str, ...] = (),
-                context_key: str = "") -> WorkItem:
+    def enqueue(
+        self,
+        *,
+        kind: str,
+        reason: str,
+        priority: int,
+        objective: str | None = None,
+        depends_on: tuple[str, ...] = (),
+        context_key: str = "",
+    ) -> WorkItem:
         item_id = self.make_id(kind, reason, objective, context_key)
         now = utc_now()
         existing = self.get(item_id)
         if existing:
             if existing.status in {"failed", "cancelled"}:
                 self.db.execute(
-                    "UPDATE work_items SET status='queued', priority=?, updated_at=?, last_error=NULL WHERE id=?",
-                    (max(priority, existing.priority), now, item_id),
+                    "UPDATE work_items SET status='queued', priority=?, updated_at=?, last_error=NULL, depends_on=? WHERE id=?",
+                    (max(priority, existing.priority), now, json.dumps(list(depends_on)), item_id),
                 )
                 self.db.commit()
                 return self.get(item_id)  # type: ignore[return-value]
             if priority > existing.priority:
-                self.db.execute("UPDATE work_items SET priority=?, updated_at=? WHERE id=?", (priority, now, item_id))
+                self.db.execute(
+                    "UPDATE work_items SET priority=?, updated_at=? WHERE id=?",
+                    (priority, now, item_id),
+                )
                 self.db.commit()
             return existing
         self.db.execute(
@@ -93,7 +112,10 @@ class WorkQueue:
         return self._row(row) if row else None
 
     def pending(self, limit: int = 50) -> list[WorkItem]:
-        rows = self.db.execute("SELECT * FROM work_items WHERE status IN ('queued','running','blocked') ORDER BY priority DESC, created_at ASC LIMIT ?", (limit,))
+        rows = self.db.execute(
+            "SELECT * FROM work_items WHERE status IN ('queued','running','blocked') ORDER BY priority DESC, created_at ASC LIMIT ?",
+            (limit,),
+        )
         return [self._row(row) for row in rows]
 
     def all(self, limit: int = 200) -> list[WorkItem]:
@@ -104,12 +126,22 @@ class WorkQueue:
         """Atomically claim the highest-priority runnable item."""
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            rows = self.db.execute("SELECT * FROM work_items WHERE status='queued' AND attempts < ? ORDER BY priority DESC, created_at ASC", (max_attempts,)).fetchall()
-            selected = next((row for row in rows if all(self._dependency_satisfied(dep) for dep in json.loads(row["depends_on"]))), None)
+            rows = self.db.execute(
+                "SELECT * FROM work_items WHERE status='queued' AND attempts < ? ORDER BY priority DESC, created_at ASC",
+                (max_attempts,),
+            ).fetchall()
+            selected = next(
+                (row for row in rows if all(self._dependency_satisfied(dep) for dep in json.loads(row["depends_on"]))),
+                None,
+            )
             if selected is None:
                 self.db.commit()
                 return None
-            self.db.execute("UPDATE work_items SET status='running', attempts=attempts+1, updated_at=? WHERE id=? AND status='queued'", (utc_now(), selected["id"]))
+            now = utc_now()
+            self.db.execute(
+                "UPDATE work_items SET status='running', attempts=attempts+1, updated_at=? WHERE id=? AND status='queued'",
+                (now, selected["id"]),
+            )
             self.db.commit()
             return self.get(selected["id"])
         except Exception:
@@ -125,36 +157,96 @@ class WorkQueue:
         if current is None:
             raise KeyError(item_id)
         status = "queued" if retry and current.attempts < max_attempts else "failed"
-        self.db.execute("UPDATE work_items SET status=?, last_error=?, updated_at=? WHERE id=?", (status, error[:2000], utc_now(), item_id))
+        self.db.execute(
+            "UPDATE work_items SET status=?, last_error=?, updated_at=? WHERE id=?",
+            (status, error[:2000], utc_now(), item_id),
+        )
         self.db.commit()
         return self.get(item_id)  # type: ignore[return-value]
 
     def block(self, item_id: str, reason: str) -> WorkItem:
-        self.db.execute("UPDATE work_items SET status='blocked', last_error=?, updated_at=? WHERE id=?", (reason[:2000], utc_now(), item_id))
+        self.db.execute(
+            "UPDATE work_items SET status='blocked', last_error=?, updated_at=? WHERE id=?",
+            (reason[:2000], utc_now(), item_id),
+        )
         self.db.commit()
         return self.get(item_id)  # type: ignore[return-value]
 
     def resume(self, item_id: str | None = None) -> list[WorkItem]:
         if item_id:
-            self.db.execute("UPDATE work_items SET status='queued', last_error=NULL, updated_at=? WHERE id=? AND status IN ('blocked','failed')", (utc_now(), item_id))
+            self.db.execute(
+                "UPDATE work_items SET status='queued', last_error=NULL, updated_at=? WHERE id=? AND status IN ('blocked','failed')",
+                (utc_now(), item_id),
+            )
         else:
-            self.db.execute("UPDATE work_items SET status='queued', last_error=NULL, updated_at=? WHERE status IN ('blocked','failed')", (utc_now(),))
+            self.db.execute(
+                "UPDATE work_items SET status='queued', last_error=NULL, updated_at=? WHERE status IN ('blocked','failed')",
+                (utc_now(),),
+            )
         self.db.commit()
         return self.pending()
+
+    def recover_running(self) -> list[WorkItem]:
+        """Return interrupted work to the queue after a process restart.
+
+        A SQLite row cannot tell us whether a previous process is still alive, so a
+        newly constructed runtime treats all persisted ``running`` items as abandoned.
+        Re-queuing them is safer than silently losing work; the attempt counter still
+        bounds repeated failures.
+        """
+        rows = self.db.execute("SELECT id FROM work_items WHERE status='running'").fetchall()
+        if not rows:
+            return []
+        now = utc_now()
+        self.db.execute(
+            "UPDATE work_items SET status='queued', last_error=?, updated_at=? WHERE status='running'",
+            ("Recovered after runtime restart; previous worker was interrupted.", now),
+        )
+        self.db.commit()
+        return [self.get(row["id"]) for row in rows if self.get(row["id"]) is not None]  # type: ignore[misc]
+
+    def unblock_ready(self) -> list[WorkItem]:
+        """Release blocked work whose dependencies are now complete."""
+        rows = self.db.execute("SELECT * FROM work_items WHERE status='blocked'").fetchall()
+        ready: list[WorkItem] = []
+        for row in rows:
+            dependencies = json.loads(row["depends_on"])
+            if dependencies and not all(self._dependency_satisfied(dep) for dep in dependencies):
+                continue
+            self.db.execute(
+                "UPDATE work_items SET status='queued', last_error=NULL, updated_at=? WHERE id=? AND status='blocked'",
+                (utc_now(), row["id"]),
+            )
+            item = self.get(row["id"])
+            if item:
+                ready.append(item)
+        self.db.commit()
+        return ready
 
     def _dependency_satisfied(self, item_id: str) -> bool:
         row = self.db.execute("SELECT status FROM work_items WHERE id=?", (item_id,)).fetchone()
         return bool(row and row["status"] == "completed")
 
     def _set_status(self, item_id: str, status: str) -> None:
-        self.db.execute("UPDATE work_items SET status=?, last_error=NULL, updated_at=? WHERE id=?", (status, utc_now(), item_id))
+        self.db.execute(
+            "UPDATE work_items SET status=?, last_error=NULL, updated_at=? WHERE id=?",
+            (status, utc_now(), item_id),
+        )
         self.db.commit()
 
     @staticmethod
     def _row(row: sqlite3.Row) -> WorkItem:
         return WorkItem(
-            id=row["id"], kind=row["kind"], reason=row["reason"], objective=row["objective"],
-            priority=row["priority"], status=row["status"], attempts=row["attempts"],
-            created_at=row["created_at"], updated_at=row["updated_at"], last_error=row["last_error"],
-            depends_on=tuple(json.loads(row["depends_on"])), context_key=row["context_key"],
+            id=row["id"],
+            kind=row["kind"],
+            reason=row["reason"],
+            objective=row["objective"],
+            priority=row["priority"],
+            status=row["status"],
+            attempts=row["attempts"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            last_error=row["last_error"],
+            depends_on=tuple(json.loads(row["depends_on"])),
+            context_key=row["context_key"],
         )
