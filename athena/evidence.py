@@ -22,13 +22,16 @@ class Evidence:
 
 
 class EvidenceLedger:
-    """In-memory evidence boundary; runtime persists the ledger through Memory events."""
+    """Evidence boundary with optional durable persistence through MemoryStore."""
 
-    def __init__(self) -> None:
+    def __init__(self, memory=None) -> None:
         self.items: list[Evidence] = []
+        self.memory = memory
 
     def add(self, evidence: Evidence) -> Evidence:
         self.items.append(evidence)
+        if self.memory is not None:
+            self.memory.remember("evidence_record", evidence.to_dict())
         return evidence
 
     def by_kind(self, kind: str) -> list[Evidence]:
