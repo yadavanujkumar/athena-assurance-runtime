@@ -33,8 +33,10 @@ class Memory:
             CREATE TABLE IF NOT EXISTS objectives (id TEXT PRIMARY KEY, text TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS findings (id TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS decisions (id TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS decision_requests (id TEXT PRIMARY KEY, finding_id TEXT NOT NULL, action TEXT NOT NULL, status TEXT NOT NULL, rationale TEXT NOT NULL, actor TEXT, created_at TEXT NOT NULL, resolved_at TEXT);
             CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);
             CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);
+            CREATE INDEX IF NOT EXISTS idx_decision_requests_status ON decision_requests(status);
         """)
         self.db.commit()
 
@@ -78,14 +80,49 @@ class Memory:
         self.db.commit()
         self.remember("decision", payload)
 
-    def findings(self) -> list[dict]:
-        return [json.loads(row["payload"]) for row in self.db.execute("SELECT * FROM findings ORDER BY rowid DESC")]
-
     def decisions(self) -> list[dict]:
         return [json.loads(row["payload"]) for row in self.db.execute("SELECT * FROM decisions ORDER BY rowid DESC")]
 
+    def create_decision_request(self, request_id: str, finding_id: str, action: str, rationale: str) -> dict:
+        now = utc_now()
+        self.db.execute(
+            "INSERT OR REPLACE INTO decision_requests(id,finding_id,action,status,rationale,actor,created_at,resolved_at) VALUES(?,?,?,?,?,?,?,?)",
+            (request_id, finding_id, action, "pending", rationale, None, now, None),
+        )
+        self.db.commit()
+        result = {"id": request_id, "finding_id": finding_id, "action": action, "status": "pending", "rationale": rationale, "actor": None, "created_at": now, "resolved_at": None}
+        self.remember("decision_requested", result)
+        return result
+
+    def decision_requests(self, status: str | None = None) -> list[dict]:
+        if status:
+            rows = self.db.execute("SELECT * FROM decision_requests WHERE status=? ORDER BY rowid DESC", (status,))
+        else:
+            rows = self.db.execute("SELECT * FROM decision_requests ORDER BY rowid DESC")
+        return [dict(row) for row in rows]
+
+    def resolve_decision_request(self, request_id: str, *, approved: bool, actor: str, rationale: str | None = None) -> dict | None:
+        row = self.db.execute("SELECT * FROM decision_requests WHERE id=?", (request_id,)).fetchone()
+        if row is None or row["status"] != "pending":
+            return None
+        status = "approved" if approved else "rejected"
+        now = utc_now()
+        final_rationale = rationale if rationale is not None else row["rationale"]
+        self.db.execute("UPDATE decision_requests SET status=?, actor=?, rationale=?, resolved_at=? WHERE id=?", (status, actor, final_rationale, now, request_id))
+        self.db.commit()
+        result = {"id": request_id, "finding_id": row["finding_id"], "action": row["action"], "status": status, "rationale": final_rationale, "actor": actor, "created_at": row["created_at"], "resolved_at": now}
+        self.remember("decision_resolved", result)
+        return result
+
+    def approved_decision(self, finding_id: str, action: str = "modify") -> dict | None:
+        row = self.db.execute("SELECT * FROM decision_requests WHERE finding_id=? AND action=? AND status='approved' ORDER BY resolved_at DESC LIMIT 1", (finding_id, action)).fetchone()
+        return dict(row) if row else None
+
     def objectives(self) -> list[dict]:
         return [dict(row) for row in self.db.execute("SELECT * FROM objectives ORDER BY rowid DESC")]
+
+    def findings(self) -> list[dict]:
+        return [json.loads(row["payload"]) for row in self.db.execute("SELECT * FROM findings ORDER BY rowid DESC")]
 
     def close(self) -> None:
         self.db.close()
