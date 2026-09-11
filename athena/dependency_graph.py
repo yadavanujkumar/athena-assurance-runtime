@@ -29,9 +29,14 @@ class DependencyGraphBuilder:
         return created
 
     def add_advisories(self, graph, root, ecosystem: str) -> list[dict]:
-        """Attach normalized audit advisories to dependency nodes without installing anything."""
+        """Refresh normalized advisories and reconcile stale advisory graph nodes."""
+        audit = self.analyzer.audit(root, ecosystem)
+        if not audit.available:
+            return []
+        advisories = self.analyzer.normalize_advisories(audit.findings, ecosystem, audit.tool)
         results: list[dict] = []
-        for advisory in self.analyzer.advisories(root, ecosystem):
+        active_ids: set[str] = set()
+        for advisory in advisories:
             dependency_id = f"{advisory.ecosystem}:{advisory.package}"
             entity_id = graph.entity_id("dependency", dependency_id)
             existing = graph.entities.get(entity_id)
@@ -48,6 +53,24 @@ class DependencyGraphBuilder:
                 "advisory", key, name=advisory.identifiers[0] if advisory.identifiers else f"{advisory.package} advisory",
                 attributes={**advisory.to_dict(), "risk": self.analyzer.advisory_risk(advisory)},
             )
+            active_ids.add(entity.id)
             graph.add_relationship(Relationship(dependency.id, "affected_by", entity.id))
             results.append({"dependency_id": dependency.id, "advisory_id": entity.id, **advisory.to_dict(), "risk": self.analyzer.advisory_risk(advisory)})
+        self.reconcile_advisories(graph, ecosystem, active_ids)
         return results
+
+    @staticmethod
+    def reconcile_advisories(graph, ecosystem: str, active_ids: set[str]) -> list[str]:
+        """Remove advisory nodes no longer reported by a successful ecosystem audit."""
+        stale = [
+            entity.id for entity in graph.entities.values()
+            if entity.kind == "advisory"
+            and entity.attributes.get("ecosystem") == ecosystem
+            and entity.id not in active_ids
+        ]
+        for entity_id in stale:
+            graph.entities.pop(entity_id, None)
+        if stale:
+            stale_set = set(stale)
+            graph.relationships = [r for r in graph.relationships if r.source not in stale_set and r.target not in stale_set]
+        return sorted(stale)
