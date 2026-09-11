@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 
 from .ai_graph import AIGraphBuilder
 from .ai_inventory import AIInventory
@@ -22,6 +23,7 @@ from .reasoning import ReasoningEngine
 from .snapshot import Snapshotter
 from .validation import ValidationEngine
 from .work import WorkQueue
+from .leases import WorkLeaseStore
 
 
 class AthenaRuntime:
@@ -52,6 +54,7 @@ class AthenaRuntime:
         self.snapshotter = Snapshotter(root)
         self.evidence = EvidenceLedger()
         self.work = WorkQueue(self.memory.db)
+        self.leases = WorkLeaseStore(self.memory.db, owner=f"pid:{os.getpid()}")
 
     def initialize(self) -> None:
         self.graph.load(self.graph_path)
@@ -98,7 +101,6 @@ class AthenaRuntime:
         return self.investigator.run("Inspect the project for assurance findings.", "security_review").findings
 
     def _refresh_dependency_advisories(self) -> list[dict]:
-        """Refresh supported supply-chain advisories before graph reasoning."""
         advisories: list[dict] = []
         for ecosystem in ("python", "node"):
             advisories.extend(self.dependency_graph.add_advisories(self.graph, self.root, ecosystem))
@@ -106,7 +108,6 @@ class AthenaRuntime:
         return advisories
 
     def _sync_advisory_work(self, objective: str | None) -> list:
-        """Turn active high-risk advisory graph nodes into durable, bounded review work."""
         active_contexts: set[str] = set()
         created = []
         for entity in self.graph.entities.values():
@@ -143,28 +144,31 @@ class AthenaRuntime:
         selected = []
         findings, evidence = [], []
         self.work.unblock_ready()
+        self.leases.reclaim_expired()
         for _ in range(max_work):
             work_item = self.work.claim_next()
             if work_item is None:
                 break
+            lease = self.leases.acquire(work_item.id)
+            if lease is None:
+                self.work.fail(work_item.id, "Work lease is held by another active worker.", retry=True)
+                continue
             selected.append(work_item)
             try:
                 result = self.investigator.run(work_item.reason, work_item.kind, reconcile_lifecycle=False)
                 findings.extend(result.findings)
                 evidence.extend(result.evidence)
                 self.work.complete(work_item.id)
-                self.memory.remember("work_completed", {"work_id": work_item.id, "kind": work_item.kind, "attempts": work_item.attempts, "findings": len(result.findings), "evidence": len(result.evidence)})
+                self.memory.remember("work_completed", {"work_id": work_item.id, "kind": work_item.kind, "attempts": work_item.attempts, "findings": len(result.findings), "evidence": len(result.evidence), "worker": lease.owner})
             except Exception as exc:
                 self.work.fail(work_item.id, f"{type(exc).__name__}: {exc}")
-                self.memory.remember("work_failed", {"work_id": work_item.id, "kind": work_item.kind, "error": str(exc)})
+                self.memory.remember("work_failed", {"work_id": work_item.id, "kind": work_item.kind, "error": str(exc), "worker": lease.owner})
+            finally:
+                self.leases.release(work_item.id)
         validation = self.investigator.run("Validate the current project state with available tests.", "validation", reconcile_lifecycle=False)
         findings.extend(validation.findings)
         evidence.extend(validation.evidence)
-
-        # Reconcile before reasoning so every downstream decision sees the current
-        # lifecycle state rather than the state from the previous assurance cycle.
         lifecycle = self.lifecycle.reconcile(findings)
-
         reasoning = []
         remediation = []
         reasoning_by_id = {}
@@ -197,7 +201,6 @@ class AthenaRuntime:
         return [item.to_dict() for item in items]
 
     def remediate(self, proposal, *, approved: bool = False, validate: bool = True) -> dict:
-        """Execute only when human approval and the complete policy decision both permit it."""
         finding = next((f for f in self.memory.findings() if f["id"] == proposal.finding_id), None)
         if finding is None:
             payload = {"finding_id": proposal.finding_id, "status": "policy_denied", "path": proposal.path, "validation": None, "rollback_available": False, "reason": "Finding is not present in durable memory; remediation is denied conservatively."}
