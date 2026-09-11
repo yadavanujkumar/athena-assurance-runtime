@@ -149,7 +149,6 @@ class AthenaRuntime:
         tasks = self.autonomous_plan()
         rows = self.memory.objectives()
         active_objective = objective or (rows[0]["text"] if rows else None)
-        changes = self.memory.fact("project.last_changes") or []
         change_classes = set(self.memory.fact("project.last_change_classes") or [])
         selected = []
         findings, evidence = [], []
