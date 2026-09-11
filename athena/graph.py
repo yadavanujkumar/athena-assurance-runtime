@@ -167,3 +167,7 @@ class KnowledgeGraph:
         for item in data.get("relationships", []):
             graph.add_relationship(Relationship(**item))
         return graph
+
+
+# Backward-compatible name used by the runtime and existing integrations.
+ProjectGraph = KnowledgeGraph
