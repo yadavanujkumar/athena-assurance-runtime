@@ -69,11 +69,7 @@ class AthenaRuntime:
         self.graph.save(self.graph_path)
 
     def set_objective(self, text: str) -> Objective:
-        objective = Objective(
-            id="OBJ-" + hashlib.sha256(text.encode()).hexdigest()[:12].upper(),
-            text=text,
-            created_at=utc_now(),
-        )
+        objective = Objective(id="OBJ-" + hashlib.sha256(text.encode()).hexdigest()[:12].upper(), text=text, created_at=utc_now())
         self.memory.add_objective(objective)
         return objective
 
@@ -201,7 +197,7 @@ class AthenaRuntime:
         self.memory.fact("work.pending", [item.to_dict() for item in pending])
         self.memory.remember("autonomous_cycle", {"objective": active_objective, "tasks": [item.kind for item in selected], "advisory_work": [item.id for item in advisory_work], "findings": len(findings), "decisions": len(decisions), "evidence": len(evidence), "remediation_proposals": len(remediation), "lifecycle": lifecycle, "pending_work": len(pending), "worker": self.worker_id})
         self.graph.save(self.graph_path)
-        return {"objective": active_objective, "plan": [{"kind": t.kind, "reason": t.reason, "priority": t.priority} for t in tasks], "work": [item.to_dict() for item in selected], "pending_work": [item.to_dict() for item in pending], "findings": [self._finding_dict(f) for f in findings], "reasoning": reasoning, "remediation_proposals": remediation, "decisions": [{"id": d.id, "finding_id": d.finding_id, "action": d.action.value, "approved": d.approved, "rationale": d.rationale} for d in decisions], "validation": ([{"source": e.source, "kind": e.kind, "detail": e.detail} for e in validation.evidence] if validation else []), "snapshot": snapshot.fingerprint}
+        return {"objective": active_objective, "plan": [{"kind": t.kind, "reason": t.reason, "priority": t.priority} for t in tasks], "work": [item.to_dict() for item in selected], "pending_work": [item.to_dict() for item in pending], "findings": [self._finding_dict(f) for f in findings], "reasoning": reasoning, "remediation_proposals": remediation, "decisions": [{"id": d.id, "finding_id": d.finding_id, "action": d.action.value, "approved": d.approved, "rationale": d.rationale} for d in decisions], "decision_requests": self.memory.decision_requests("pending"), "validation": ([{"source": e.source, "kind": e.kind, "detail": e.detail} for e in validation.evidence] if validation else []), "snapshot": snapshot.fingerprint}
 
     def resume(self, max_work: int | None = None) -> dict:
         self.work.resume()
@@ -210,6 +206,12 @@ class AthenaRuntime:
     def work_status(self, include_completed: bool = False) -> list[dict]:
         items = self.work.all() if include_completed else self.work.pending()
         return [item.to_dict() for item in items]
+
+    def decision_requests(self, status: str | None = None) -> list[dict]:
+        return self.memory.decision_requests(status)
+
+    def resolve_decision(self, request_id: str, *, approved: bool, actor: str, rationale: str | None = None) -> dict | None:
+        return self.memory.resolve_decision_request(request_id, approved=approved, actor=actor, rationale=rationale)
 
     def remediate(self, proposal, *, approved: bool = False, validate: bool = True) -> dict:
         finding = next((f for f in self.memory.findings() if f["id"] == proposal.finding_id), None)
@@ -221,7 +223,13 @@ class AthenaRuntime:
             payload = {"finding_id": proposal.finding_id, "status": "policy_denied", "path": proposal.path, "validation": None, "rollback_available": False, "reason": "Policy does not grant MODIFY authority for this finding."}
             self.memory.remember("remediation_denied", payload)
             return payload
-        outcome = self.remediation_loop.execute(proposal, approved=approved, validate=validate)
+        if not approved:
+            request = self.memory.approved_decision(proposal.finding_id, "modify")
+            if request is None:
+                payload = {"finding_id": proposal.finding_id, "status": "approval_required", "path": proposal.path, "validation": None, "rollback_available": False, "reason": "No durable human approval exists for this MODIFY action."}
+                self.memory.remember("remediation_approval_required", payload)
+                return payload
+        outcome = self.remediation_loop.execute(proposal, approved=True, validate=validate)
         payload = outcome.to_dict()
         self.memory.remember("remediation_outcome", payload)
         if outcome.status in {"accepted", "rolled_back", "rollback_blocked"}:
@@ -250,7 +258,7 @@ class AthenaRuntime:
         return {"id": finding.id, "title": finding.title, "description": finding.description, "severity": finding.severity.value, "confidence": finding.confidence, "evidence": finding.evidence, "remediation": finding.remediation, "status": finding.status}
 
     def status(self) -> dict:
-        return {"root": str(self.root), "graph_entities": len(self.graph.entities), "graph_relationships": len(self.graph.relationships), "objectives": self.memory.objectives(), "findings": self.memory.findings(), "work": self.work_status(), "recent_events": self.memory.recent_events(), "config": {"max_work_per_cycle": self.config.max_work_per_cycle, "max_attempts": self.config.max_attempts, "lease_ttl_seconds": self.config.lease_ttl_seconds, "validation_enabled": self.config.validation_enabled, "authority": dict(self.config.authority)}, "worker": self.worker_id}
+        return {"root": str(self.root), "graph_entities": len(self.graph.entities), "graph_relationships": len(self.graph.relationships), "objectives": self.memory.objectives(), "findings": self.memory.findings(), "work": self.work_status(), "decision_requests": self.memory.decision_requests(), "recent_events": self.memory.recent_events(), "config": {"max_work_per_cycle": self.config.max_work_per_cycle, "max_attempts": self.config.max_attempts, "lease_ttl_seconds": self.config.lease_ttl_seconds, "validation_enabled": self.config.validation_enabled, "authority": dict(self.config.authority)}, "worker": self.worker_id}
 
     def close(self) -> None:
         self.memory.close()
