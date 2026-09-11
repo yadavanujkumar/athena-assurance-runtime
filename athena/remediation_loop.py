@@ -31,7 +31,7 @@ class RemediationLoop:
     def execute(self, proposal: PatchProposal, *, approved: bool = False, validate: bool = True) -> RemediationOutcome:
         if not approved:
             return RemediationOutcome(proposal.finding_id, "approval_required", proposal.path, reason="Explicit approval is required before any write.")
-        path = self.remediation.apply(self.root, proposal, approved=True)
+        self.remediation.apply(self.root, proposal, approved=True)
         applied_sha256 = self.remediation.sha256(proposal.after)
         results: list[dict] = []
         if validate:
