@@ -115,6 +115,15 @@ class ReasoningEngine:
         if state is None:
             fingerprint = self.lifecycle.fingerprint(finding)
             state = lifecycle_map.get(fingerprint)
+        lifecycle_state = str((state or {}).get("state", "new"))
+        if state:
+            risk_factors.append(f"Finding lifecycle state is {lifecycle_state}.")
+            if lifecycle_state == "worsening":
+                risk_factors.append("Severity or detector confidence increased since the prior observation.")
+            elif lifecycle_state == "recurring":
+                risk_factors.append("The same evidence has persisted across assurance cycles.")
+            elif lifecycle_state == "reopened":
+                risk_factors.append("The finding reappeared after being previously resolved.")
 
         decisions = [d for d in self.memory.decisions() if d.get("finding_id") == finding.id][:5]
         drift_events = self.memory.search_events("project_drift", limit=5)
@@ -124,14 +133,28 @@ class ReasoningEngine:
             why_now.append("The current cycle detected change classes: " + ", ".join(classes) + ".")
         if drift_events:
             why_now.append("Recent project drift exists in durable memory.")
-        if state and state.get("status") == "reopened":
-            why_now.append("This finding was previously resolved and has reappeared.")
+        if lifecycle_state == "new":
+            why_now.append("This is a newly observed finding and has no prior lifecycle history.")
+        elif lifecycle_state == "reopened":
+            why_now.append("This finding was previously resolved and has reappeared, indicating regression.")
+        elif lifecycle_state == "worsening":
+            why_now.append("The finding is worsening relative to its previous observation and should be escalated.")
+        elif lifecycle_state == "recurring":
+            why_now.append("The finding is recurring; repeated evidence should be monitored without duplicating investigation unnecessarily.")
+        elif lifecycle_state == "resolved":
+            why_now.append("The finding is resolved; the current action should be limited to observation and closure evidence.")
         if supply_risk:
             why_now.append("A connected dependency has active advisory exposure requiring supply-chain review.")
         if not why_now:
             why_now.append("The finding is part of the current assurance cycle.")
 
         recommendations: list[str] = []
+        if lifecycle_state == "resolved":
+            recommendations.append("Preserve resolution evidence and observe for recurrence; do not propose remediation for a resolved finding.")
+        elif lifecycle_state in {"new", "reopened", "worsening"}:
+            recommendations.append("Investigate the finding and establish current evidence before any write action.")
+        else:
+            recommendations.append("Monitor the recurring finding and run targeted validation if its risk or evidence changes.")
         if not affected:
             recommendations.append("Investigate the finding source and establish a graph link to the affected component.")
         if any(e.get("kind") == "dependency" for e in affected) or supply_risk:
@@ -140,8 +163,6 @@ class ReasoningEngine:
             recommendations.append("Trace the connected AI provider, model, prompt, tool and execution/network boundaries.")
         if finding.severity.value in {"high", "critical"} or supply_risk >= 80:
             recommendations.append("Run focused validation and preserve evidence before any write action.")
-        if not recommendations:
-            recommendations.append("Run targeted validation against the affected component and update the finding with new evidence.")
 
         return AssuranceReasoning(
             finding_id=finding.id,
