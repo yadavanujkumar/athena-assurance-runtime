@@ -15,6 +15,7 @@ from .memory import Memory
 from .models import Objective, Relationship
 from .planner import Planner
 from .policy import Authority, PolicyEngine
+from .reasoning import ReasoningEngine
 from .snapshot import Snapshotter
 
 
@@ -35,6 +36,7 @@ class AthenaRuntime:
         self.ai_graph = AIGraphBuilder()
         self.dependency_graph = DependencyGraphBuilder()
         self.lifecycle = FindingLifecycle(self.memory)
+        self.reasoning = ReasoningEngine(self.memory)
 
     def initialize(self) -> None:
         self.state.mkdir(parents=True, exist_ok=True)
@@ -93,7 +95,9 @@ class AthenaRuntime:
             for finding in detector.scan(self.root):
                 self.memory.add_finding(finding)
                 self._project_finding(finding)
-                results.append(self._finding_dict(finding) | {"recommended_action": self.policy.next_action(finding).value})
+                reasoning = self.reasoning.reason(finding, self.graph)
+                self.memory.remember("assurance_reasoning", reasoning.to_dict())
+                results.append(self._finding_dict(finding) | {"recommended_action": self.policy.next_action(finding).value, "reasoning": reasoning.to_dict()})
         self.graph.save(self.graph_path)
         self.memory.remember("inspection", {"finding_count": len(results)})
         return results
@@ -105,6 +109,7 @@ class AthenaRuntime:
         tasks = self.autonomous_plan()
         selected = tasks[:5]
         cycle_objective = objective or (selected[0].reason if selected else "baseline assurance")
+        _, change_classes = self._change_classes()
         findings, evidence = [], []
         for task in selected:
             result = self.investigator.run(task.reason, task.kind, reconcile_lifecycle=False)
@@ -113,15 +118,19 @@ class AthenaRuntime:
         validation = self.investigator.run("Validate the current project state with available tests.", "validation", reconcile_lifecycle=False)
         findings.extend(validation.findings)
         evidence.extend(validation.evidence)
+        reasoning = []
         for finding in findings:
             self._project_finding(finding)
+            context = self.reasoning.reason(finding, self.graph, change_classes=change_classes)
+            reasoning.append(context.to_dict())
+            self.memory.remember("assurance_reasoning", context.to_dict())
         lifecycle = self.lifecycle.reconcile(findings)
         decisions = self.assurance.assess(findings)
         snapshot = self.snapshotter.capture()
         self.memory.fact("project.snapshot", snapshot.fingerprint)
         self.graph.save(self.graph_path)
         self.memory.remember("autonomous_cycle", {"objective": cycle_objective, "tasks": [t.kind for t in selected], "findings": len(findings), "decisions": len(decisions), "evidence": len(evidence), "lifecycle": lifecycle})
-        return {"objective": cycle_objective, "plan": [{"kind": t.kind, "reason": t.reason, "priority": t.priority} for t in selected], "findings": [self._finding_dict(f) for f in findings], "decisions": [{"id": d.id, "finding_id": d.finding_id, "action": d.action.value, "approved": d.approved, "rationale": d.rationale} for d in decisions], "validation": [{"source": e.source, "kind": e.kind, "detail": e.detail} for e in validation.evidence], "snapshot": snapshot.fingerprint}
+        return {"objective": cycle_objective, "plan": [{"kind": t.kind, "reason": t.reason, "priority": t.priority} for t in selected], "findings": [self._finding_dict(f) for f in findings], "reasoning": reasoning, "decisions": [{"id": d.id, "finding_id": d.finding_id, "action": d.action.value, "approved": d.approved, "rationale": d.rationale} for d in decisions], "validation": [{"source": e.source, "kind": e.kind, "detail": e.detail} for e in validation.evidence], "snapshot": snapshot.fingerprint}
 
     def _project_finding(self, finding) -> None:
         entity = self.graph.upsert_entity("finding", finding.id, name=finding.id, attributes={"finding_id": finding.id, "title": finding.title, "severity": finding.severity.value, "confidence": finding.confidence, "status": finding.status})
