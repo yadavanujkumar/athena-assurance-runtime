@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 from .ai_inventory import AIInventory
-from .models import Entity, Relationship
+from .models import Relationship
 
 
 class AIGraphBuilder:
-    """Projects AI inventory signals into the living knowledge graph."""
+    """Projects AI signals into explicit trust-boundary graph relationships."""
+
+    RELATIONS = {
+        "provider": "uses_provider",
+        "model": "uses_model",
+        "prompt": "defines_prompt",
+        "tool": "registers_tool",
+        "network_boundary": "exposes_network",
+        "execution_boundary": "exposes_execution",
+    }
 
     def build(self, graph, root) -> list[dict]:
         signals = AIInventory().scan(root)
@@ -14,10 +23,12 @@ class AIGraphBuilder:
             return []
         created: list[dict] = []
         for signal in signals:
-            entity_id = graph.entity_id(f"ai_{signal.kind}", f"{signal.source}:{signal.name}")
-            entity = graph.add_entity(Entity(entity_id, f"ai_{signal.kind}", signal.name, signal.source))
-            source_id = next((e.id for e in graph.entities.values() if e.path == signal.source), project.id)
-            relation = "exposes" if signal.kind.endswith("_boundary") else "contains_ai_signal"
-            graph.add_relationship(Relationship(source_id, relation, entity.id))
+            entity = graph.upsert_entity(
+                f"ai_{signal.kind}", f"{signal.source}:{signal.name}",
+                name=signal.name, path=signal.source,
+                attributes={"signal_kind": signal.kind, "confidence": signal.confidence, "detail": signal.detail},
+            )
+            source = next((e for e in graph.entities.values() if e.path == signal.source and e.kind in {"file", "python_file"}), project)
+            graph.add_relationship(Relationship(source.id, self.RELATIONS.get(signal.kind, "contains_ai_signal"), entity.id))
             created.append({"id": entity.id, "kind": entity.kind, "name": entity.name, "source": signal.source, "confidence": signal.confidence})
         return created
