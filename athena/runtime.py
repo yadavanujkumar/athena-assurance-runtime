@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+from .assurance import AssuranceEngine
 from .detectors import default_detectors
 from .graph import KnowledgeGraph
+from .investigation import InvestigationEngine
 from .memory import Memory
 from .models import Objective
 from .planner import Planner
@@ -22,6 +24,8 @@ class AthenaRuntime:
         self.graph = KnowledgeGraph.load(self.graph_path)
         self.policy = PolicyEngine(authority)
         self.planner = Planner()
+        self.investigator = InvestigationEngine(self.root, self.memory)
+        self.assurance = AssuranceEngine(self.memory, self.policy)
 
     def initialize(self) -> None:
         self.state.mkdir(parents=True, exist_ok=True)
@@ -52,7 +56,8 @@ class AthenaRuntime:
             {
                 "objective": objective.text if objective else None,
                 "tasks": [
-                    {"kind": t.kind, "reason": t.reason, "priority": t.priority} for t in tasks
+                    {"kind": t.kind, "reason": t.reason, "priority": t.priority}
+                    for t in tasks
                 ],
             },
         )
@@ -80,6 +85,54 @@ class AthenaRuntime:
                 )
         self.memory.remember("inspection", {"finding_count": len(results)})
         return results
+
+    def run_autonomous_cycle(self, objective: str | None = None) -> dict:
+        """Discover, plan, investigate, assess and persist one bounded assurance cycle."""
+        self.initialize()
+        if objective:
+            self.set_objective(objective)
+        tasks = self.autonomous_plan()
+        selected = tasks[:5]
+        cycle_objective = objective or (selected[0].reason if selected else "baseline assurance")
+        result = self.investigator.run(cycle_objective)
+        decisions = self.assurance.assess(result.findings)
+        self.memory.remember(
+            "autonomous_cycle",
+            {
+                "objective": cycle_objective,
+                "tasks": [task.kind for task in selected],
+                "findings": len(result.findings),
+                "decisions": len(decisions),
+            },
+        )
+        return {
+            "objective": cycle_objective,
+            "plan": [task.__dict__ if hasattr(task, "__dict__") else {"kind": task.kind, "reason": task.reason, "priority": task.priority} for task in selected],
+            "findings": [self._finding_dict(f) for f in result.findings],
+            "decisions": [
+                {
+                    "id": d.id,
+                    "finding_id": d.finding_id,
+                    "action": d.action.value,
+                    "approved": d.approved,
+                    "rationale": d.rationale,
+                }
+                for d in decisions
+            ],
+        }
+
+    @staticmethod
+    def _finding_dict(finding) -> dict:
+        return {
+            "id": finding.id,
+            "title": finding.title,
+            "description": finding.description,
+            "severity": finding.severity.value,
+            "confidence": finding.confidence,
+            "evidence": finding.evidence,
+            "remediation": finding.remediation,
+            "status": finding.status,
+        }
 
     def status(self) -> dict:
         return {
