@@ -1,3 +1,5 @@
+import json
+
 from athena.lifecycle import FindingLifecycle
 from athena.memory import Memory
 from athena.models import Finding, Severity
@@ -59,5 +61,6 @@ def test_lifecycle_transition_is_durable(tmp_path):
     lifecycle.reconcile([finding])
     lifecycle.reconcile([])
     events = memory.search_events("finding_lifecycle_transition", limit=5)
-    assert any(event["payload"]["to"] == "resolved" for event in events)
+    payloads = [json.loads(event["payload"]) for event in events]
+    assert any(event["to"] == "resolved" for event in payloads)
     memory.close()
