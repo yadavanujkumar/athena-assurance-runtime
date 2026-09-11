@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
 from .models import Decision, Finding, Objective, utc_now
 
 
 _MISSING = object()
+
+
+def _json_default(value):
+    if is_dataclass(value):
+        return asdict(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 class Memory:
@@ -32,14 +39,14 @@ class Memory:
         self.db.commit()
 
     def remember(self, kind: str, payload: dict) -> None:
-        self.db.execute("INSERT INTO events(kind,payload,created_at) VALUES(?,?,?)", (kind, json.dumps(payload, sort_keys=True), utc_now()))
+        self.db.execute("INSERT INTO events(kind,payload,created_at) VALUES(?,?,?)", (kind, json.dumps(payload, sort_keys=True, default=_json_default), utc_now()))
         self.db.commit()
 
     def fact(self, key: str, value: object = _MISSING):
         if value is _MISSING:
             row = self.db.execute("SELECT value FROM facts WHERE key = ?", (key,)).fetchone()
             return json.loads(row["value"]) if row else None
-        self.db.execute("INSERT OR REPLACE INTO facts(key,value,updated_at) VALUES(?,?,?)", (key, json.dumps(value, sort_keys=True), utc_now()))
+        self.db.execute("INSERT OR REPLACE INTO facts(key,value,updated_at) VALUES(?,?,?)", (key, json.dumps(value, sort_keys=True, default=_json_default), utc_now()))
         self.db.commit()
         return value
 
