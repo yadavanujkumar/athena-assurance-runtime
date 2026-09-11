@@ -41,9 +41,11 @@ class AthenaRuntime:
         self.memory.fact("project.root", str(self.root))
         self.memory.fact("graph.entities", len(self.graph.entities))
         self.memory.fact("ai.signals", ai_signals)
-        snapshot = self.snapshotter.capture()
-        self.memory.fact("project.snapshot", snapshot.fingerprint)
-        self.memory.remember("project_initialized", {"root": str(self.root), "entities": len(self.graph.entities), "ai_signals": len(ai_signals), "snapshot": snapshot.fingerprint})
+        if self.memory.fact("project.initialized") is None:
+            snapshot = self.snapshotter.capture()
+            self.memory.fact("project.snapshot", snapshot.fingerprint)
+            self.memory.fact("project.initialized", True)
+            self.memory.remember("project_initialized", {"root": str(self.root), "entities": len(self.graph.entities), "ai_signals": len(ai_signals), "snapshot": snapshot.fingerprint})
 
     def set_objective(self, text: str) -> Objective:
         objective = Objective("O-" + hashlib.sha256(text.encode()).hexdigest()[:10].upper(), text)
@@ -100,12 +102,19 @@ class AthenaRuntime:
         tasks = self.autonomous_plan()
         selected = tasks[:5]
         cycle_objective = objective or (selected[0].reason if selected else "baseline assurance")
-        result = self.investigator.run(cycle_objective)
-        decisions = self.assurance.assess(result.findings)
+        findings = []
+        investigation_results = []
+        for task in selected:
+            result = self.investigator.run(task.reason, task.kind)
+            investigation_results.append(result)
+            findings.extend(result.findings)
+        validation = self.investigator.run("Validate the current project state with available tests.", "validation")
+        findings.extend(validation.findings)
+        decisions = self.assurance.assess(findings)
         snapshot = self.snapshotter.capture()
         self.memory.fact("project.snapshot", snapshot.fingerprint)
-        self.memory.remember("autonomous_cycle", {"objective": cycle_objective, "tasks": [t.kind for t in selected], "findings": len(result.findings), "decisions": len(decisions)})
-        return {"objective": cycle_objective, "plan": [{"kind": t.kind, "reason": t.reason, "priority": t.priority} for t in selected], "findings": [self._finding_dict(f) for f in result.findings], "decisions": [{"id": d.id, "finding_id": d.finding_id, "action": d.action.value, "approved": d.approved, "rationale": d.rationale} for d in decisions], "snapshot": snapshot.fingerprint}
+        self.memory.remember("autonomous_cycle", {"objective": cycle_objective, "tasks": [t.kind for t in selected], "findings": len(findings), "decisions": len(decisions), "validation_findings": len(validation.findings)})
+        return {"objective": cycle_objective, "plan": [{"kind": t.kind, "reason": t.reason, "priority": t.priority} for t in selected], "findings": [self._finding_dict(f) for f in findings], "decisions": [{"id": d.id, "finding_id": d.finding_id, "action": d.action.value, "approved": d.approved, "rationale": d.rationale} for d in decisions], "validation": [e.__dict__ if hasattr(e, "__dict__") else {"source": e.source, "kind": e.kind, "detail": e.detail} for e in validation.evidence], "snapshot": snapshot.fingerprint}
 
     @staticmethod
     def _finding_dict(finding) -> dict:
