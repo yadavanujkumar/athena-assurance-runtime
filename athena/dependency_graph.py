@@ -33,7 +33,8 @@ class DependencyGraphBuilder:
         results: list[dict] = []
         for advisory in self.analyzer.advisories(root, ecosystem):
             dependency_id = f"{advisory.ecosystem}:{advisory.package}"
-            existing = graph.entities.get(graph.stable_id("dependency", dependency_id))
+            entity_id = graph.entity_id("dependency", dependency_id)
+            existing = graph.entities.get(entity_id)
             attributes = dict(existing.attributes) if existing else {}
             attributes.update({"ecosystem": advisory.ecosystem, "name": advisory.package})
             dependency = graph.upsert_entity(
