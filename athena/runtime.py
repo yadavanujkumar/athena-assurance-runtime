@@ -81,6 +81,8 @@ class AthenaRuntime:
         changes = self.change_analyzer.compare(previous, current)
         classes = self.change_analyzer.classify(changes)
         self.memory.fact("project.inventory", current)
+        self.memory.fact("project.last_changes", [{"path": c.path, "kind": c.kind} for c in changes])
+        self.memory.fact("project.last_change_classes", sorted(classes))
         if changes:
             self.memory.remember("project_drift", {"changes": [{"path": c.path, "kind": c.kind} for c in changes], "classes": sorted(classes)})
         return ([{"path": c.path, "kind": c.kind} for c in changes], classes)
@@ -91,14 +93,8 @@ class AthenaRuntime:
         ids: dict[str, str] = {}
         for task in tasks:
             dependency_ids = tuple(ids[d] for d in task.depends_on if d in ids)
-            item = self.work.enqueue(
-                kind=task.kind,
-                reason=task.reason,
-                priority=task.priority,
-                objective=objective,
-                depends_on=dependency_ids,
-                context_key=context,
-            )
+            item = self.work.enqueue(kind=task.kind, reason=task.reason, priority=task.priority,
+                                     objective=objective, depends_on=dependency_ids, context_key=context)
             ids[task.kind] = item.id
         self.memory.fact("work.pending", [item.to_dict() for item in self.work.pending()])
 
@@ -136,30 +132,24 @@ class AthenaRuntime:
         tasks = self.autonomous_plan()
         rows = self.memory.objectives()
         active_objective = objective or (rows[0]["text"] if rows else None)
-        changes, change_classes = self._change_classes()
+        changes = self.memory.fact("project.last_changes") or []
+        change_classes = set(self.memory.fact("project.last_change_classes") or [])
         selected = []
+        findings, evidence = [], []
         for _ in range(max_work):
-            item = self.work.claim_next()
-            if item is None:
+            work_item = self.work.claim_next()
+            if work_item is None:
                 break
-            selected.append(item)
+            selected.append(work_item)
             try:
-                result = self.investigator.run(item.reason, item.kind, reconcile_lifecycle=False)
-                item_result = result
-                self.work.complete(item.id)
-                self.memory.remember("work_completed", {"work_id": item.id, "kind": item.kind, "attempts": item.attempts, "findings": len(result.findings), "evidence": len(result.evidence)})
+                result = self.investigator.run(work_item.reason, work_item.kind, reconcile_lifecycle=False)
+                findings.extend(result.findings)
+                evidence.extend(result.evidence)
+                self.work.complete(work_item.id)
+                self.memory.remember("work_completed", {"work_id": work_item.id, "kind": work_item.kind, "attempts": work_item.attempts, "findings": len(result.findings), "evidence": len(result.evidence)})
             except Exception as exc:
-                self.work.fail(item.id, f"{type(exc).__name__}: {exc}")
-                self.memory.remember("work_failed", {"work_id": item.id, "kind": item.kind, "error": str(exc)})
-                continue
-            findings = item_result.findings
-            evidence = item_result.evidence
-            if "_findings" not in locals():
-                _findings, _evidence = [], []
-            _findings.extend(findings)
-            _evidence.extend(evidence)
-        findings = locals().get("_findings", [])
-        evidence = locals().get("_evidence", [])
+                self.work.fail(work_item.id, f"{type(exc).__name__}: {exc}")
+                self.memory.remember("work_failed", {"work_id": work_item.id, "kind": work_item.kind, "error": str(exc)})
         validation = self.investigator.run("Validate the current project state with available tests.", "validation", reconcile_lifecycle=False)
         findings.extend(validation.findings)
         evidence.extend(validation.evidence)
