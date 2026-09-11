@@ -4,6 +4,7 @@ import hashlib
 from pathlib import Path
 
 from .assurance import AssuranceEngine
+from .change import ChangeAnalyzer
 from .detectors import default_detectors
 from .graph import KnowledgeGraph
 from .investigation import InvestigationEngine
@@ -28,6 +29,7 @@ class AthenaRuntime:
         self.investigator = InvestigationEngine(self.root, self.memory)
         self.assurance = AssuranceEngine(self.memory, self.policy)
         self.snapshotter = Snapshotter(self.root)
+        self.change_analyzer = ChangeAnalyzer()
 
     def initialize(self) -> None:
         self.state.mkdir(parents=True, exist_ok=True)
@@ -57,12 +59,28 @@ class AthenaRuntime:
         ]
         return [{"priority": p, "text": t, "source": "athena"} for p, t in proposals]
 
+    def _change_classes(self) -> tuple[list[dict], set[str]]:
+        previous = self.memory.fact("project.inventory")
+        current = self.change_analyzer.inventory(self.root)
+        if previous:
+            previous = {k: tuple(v) for k, v in previous.items()}
+        else:
+            previous = {}
+        changes = self.change_analyzer.compare(previous, current)
+        classes = self.change_analyzer.classify(changes)
+        self.memory.fact("project.inventory", current)
+        if changes:
+            payload = {"changes": [{"path": c.path, "kind": c.kind} for c in changes], "classes": sorted(classes)}
+            self.memory.remember("project_drift", payload)
+        return ([{"path": c.path, "kind": c.kind} for c in changes], classes)
+
     def autonomous_plan(self):
         self.initialize()
         rows = self.memory.objectives()
         objective = Objective(rows[0]["id"], rows[0]["text"], rows[0]["status"], rows[0]["created_at"]) if rows else None
-        tasks = self.planner.plan(objective, self.graph, self.memory.findings())
-        self.memory.remember("plan", {"objective": objective.text if objective else None, "tasks": [{"kind": t.kind, "reason": t.reason, "priority": t.priority} for t in tasks]})
+        _, change_classes = self._change_classes()
+        tasks = self.planner.plan(objective, self.graph, self.memory.findings(), change_classes)
+        self.memory.remember("plan", {"objective": objective.text if objective else None, "change_classes": sorted(change_classes), "tasks": [{"kind": t.kind, "reason": t.reason, "priority": t.priority} for t in tasks]})
         return tasks
 
     def inspect(self) -> list[dict]:
@@ -85,13 +103,9 @@ class AthenaRuntime:
         result = self.investigator.run(cycle_objective)
         decisions = self.assurance.assess(result.findings)
         snapshot = self.snapshotter.capture()
-        previous = self.memory.fact("project.snapshot")
-        changed = previous is not None and previous != snapshot.fingerprint
         self.memory.fact("project.snapshot", snapshot.fingerprint)
-        if changed:
-            self.memory.remember("project_changed", {"previous_snapshot": previous, "current_snapshot": snapshot.fingerprint})
-        self.memory.remember("autonomous_cycle", {"objective": cycle_objective, "tasks": [t.kind for t in selected], "findings": len(result.findings), "decisions": len(decisions), "changed": changed})
-        return {"objective": cycle_objective, "plan": [{"kind": t.kind, "reason": t.reason, "priority": t.priority} for t in selected], "findings": [self._finding_dict(f) for f in result.findings], "decisions": [{"id": d.id, "finding_id": d.finding_id, "action": d.action.value, "approved": d.approved, "rationale": d.rationale} for d in decisions], "snapshot": snapshot.fingerprint, "changed": changed}
+        self.memory.remember("autonomous_cycle", {"objective": cycle_objective, "tasks": [t.kind for t in selected], "findings": len(result.findings), "decisions": len(decisions)})
+        return {"objective": cycle_objective, "plan": [{"kind": t.kind, "reason": t.reason, "priority": t.priority} for t in selected], "findings": [self._finding_dict(f) for f in result.findings], "decisions": [{"id": d.id, "finding_id": d.finding_id, "action": d.action.value, "approved": d.approved, "rationale": d.rationale} for d in decisions], "snapshot": snapshot.fingerprint}
 
     @staticmethod
     def _finding_dict(finding) -> dict:
