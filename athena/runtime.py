@@ -95,7 +95,7 @@ class AthenaRuntime:
 
     def autonomous_plan(self, objective: str | None = None):
         changes, change_classes = self._change_classes()
-        tasks = self.planner.plan(objective or self._active_objective(), change_classes=change_classes)
+        tasks = self.planner.plan(objective or self._active_objective(), self.graph, self.memory.findings(), change_classes=change_classes)
         self._sync_work(tasks, objective or self._active_objective(), changes)
         return tasks
 
@@ -106,6 +106,14 @@ class AthenaRuntime:
     def inspect(self):
         self.initialize()
         return self.investigator.run("Inspect the project for assurance findings.", "security_review").findings
+
+    def _refresh_dependency_advisories(self) -> list[dict]:
+        """Refresh supported supply-chain advisories before graph reasoning."""
+        advisories: list[dict] = []
+        for ecosystem in ("python", "node"):
+            advisories.extend(self.dependency_graph.add_advisories(self.graph, self.root, ecosystem))
+        self.memory.fact("dependencies.advisories", advisories)
+        return advisories
 
     def run_autonomous_cycle(self, objective: str | None = None, max_work: int = 5) -> dict:
         self.initialize()
@@ -133,6 +141,7 @@ class AthenaRuntime:
             except Exception as exc:
                 self.work.fail(work_item.id, f"{type(exc).__name__}: {exc}")
                 self.memory.remember("work_failed", {"work_id": work_item.id, "kind": work_item.kind, "error": str(exc)})
+        self._refresh_dependency_advisories()
         validation = self.investigator.run("Validate the current project state with available tests.", "validation", reconcile_lifecycle=False)
         findings.extend(validation.findings)
         evidence.extend(validation.evidence)
