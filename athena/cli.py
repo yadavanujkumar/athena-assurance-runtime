@@ -20,9 +20,18 @@ def build_parser() -> argparse.ArgumentParser:
     work = sub.add_parser("work")
     work.add_argument("path", nargs="?", default=".")
     work.add_argument("--all", action="store_true", help="Include completed work")
+    decisions = sub.add_parser("decisions")
+    decisions.add_argument("path", nargs="?", default=".")
+    decisions.add_argument("--status", choices=("pending", "approved", "rejected"))
+    for command, approved in (("approve", True), ("reject", False)):
+        decision = sub.add_parser(command)
+        decision.add_argument("request_id")
+        decision.add_argument("path", nargs="?", default=".")
+        decision.add_argument("--actor", required=True, help="Human or automation identity resolving the request")
+        decision.add_argument("--rationale", help="Optional rationale recorded with the resolution")
     resume = sub.add_parser("resume")
     resume.add_argument("path", nargs="?", default=".")
-    resume.add_argument("--max-work", type=int, default=5)
+    resume.add_argument("--max-work", type=int, default=None)
     objective = sub.add_parser("objective")
     objective.add_argument("text")
     objective.add_argument("path", nargs="?", default=".")
@@ -30,13 +39,13 @@ def build_parser() -> argparse.ArgumentParser:
     cycle.add_argument("path", nargs="?", default=".")
     cycle.add_argument("--objective", help="Explicit assurance objective")
     cycle.add_argument("--yes", action="store_true", help="Accept ATHENA's baseline objective without prompting")
-    cycle.add_argument("--max-work", type=int, default=5)
+    cycle.add_argument("--max-work", type=int, default=None)
     export = sub.add_parser("export")
     export.add_argument("path", nargs="?", default=".")
     export.add_argument("-o", "--output", default=".athena/assurance-bundle.json")
     watch = sub.add_parser("watch")
     watch.add_argument("path", nargs="?", default=".")
-    watch.add_argument("--interval", type=float, default=5.0)
+    watch.add_argument("--interval", type=float, default=None)
     watch.add_argument("--once", action="store_true")
     return parser
 
@@ -77,6 +86,14 @@ def main(argv=None) -> int:
             print(json.dumps(runtime.memory.findings(), indent=2))
         elif args.command == "work":
             print(json.dumps(runtime.work_status(args.all), indent=2))
+        elif args.command == "decisions":
+            print(json.dumps(runtime.decision_requests(args.status), indent=2))
+        elif args.command in {"approve", "reject"}:
+            result = runtime.resolve_decision(args.request_id, approved=args.command == "approve", actor=args.actor, rationale=args.rationale)
+            if result is None:
+                print(json.dumps({"error": "Decision request not found or already resolved"}, indent=2))
+                return 1
+            print(json.dumps(result, indent=2))
         elif args.command == "resume":
             print(json.dumps(runtime.resume(args.max_work), indent=2))
         elif args.command == "objective":
@@ -96,12 +113,13 @@ def main(argv=None) -> int:
                 output = runtime.root / output
             print(json.dumps({"path": str(AssuranceExporter(runtime).write(output))}, indent=2))
         elif args.command == "watch":
+            interval = runtime.config.watch_interval_seconds if args.interval is None else args.interval
             def changed(fingerprint):
                 runtime.memory.remember("project_changed", {"fingerprint": fingerprint})
                 print(f"Change detected: {fingerprint}")
                 print(json.dumps(runtime.run_autonomous_cycle(), indent=2))
             runtime.initialize()
-            ProjectWatcher(runtime.root, args.interval).run(changed, args.once)
+            ProjectWatcher(runtime.root, interval).run(changed, args.once)
         return 0
     finally:
         runtime.close()
