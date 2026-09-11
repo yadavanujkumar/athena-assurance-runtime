@@ -32,3 +32,7 @@ class PolicyEngine:
 
     def can_execute(self, action: Action) -> bool:
         return self.authority.allowed(action)
+
+    def can_remediate(self, finding: Finding) -> bool:
+        """A write is permitted only when policy grants MODIFY authority."""
+        return self.authority.allowed(Action.MODIFY) and self.next_action(finding) is Action.MODIFY
