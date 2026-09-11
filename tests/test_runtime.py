@@ -18,7 +18,7 @@ def test_runtime_finds_eval(tmp_path: Path):
     runtime = AthenaRuntime(tmp_path)
     findings = runtime.inspect()
     runtime.close()
-    assert any(f["title"] == "Dynamic eval usage" for f in findings)
+    assert any(f.title == "Dynamic eval usage" for f in findings)
 
 
 def test_memory_survives_runtime_restart(tmp_path: Path):
