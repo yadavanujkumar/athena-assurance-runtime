@@ -43,7 +43,7 @@ class InvestigationEngine:
         findings: list[Finding] = []
         kind = task_kind or self._infer_task(objective)
 
-        if kind == "dependency_review":
+        if kind in {"dependency_review", "dependency_advisory_review"}:
             deps = self.dependencies.inventory(self.root)
             evidence.extend(Evidence(d.source, "dependency", f"{d.ecosystem}:{d.name}@{d.version or 'unversioned'}") for d in deps)
             self.memory.fact("dependencies.inventory", [d.to_dict() for d in deps])
