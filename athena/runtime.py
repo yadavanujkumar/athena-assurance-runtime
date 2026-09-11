@@ -184,23 +184,21 @@ class AthenaRuntime:
         return [item.to_dict() for item in items]
 
     def remediate(self, proposal, *, approved: bool = False, validate: bool = True) -> dict:
-        """Execute a proposal only when both human approval and policy MODIFY authority permit it."""
+        """Execute only when human approval and the complete policy decision both permit it."""
         finding = next((f for f in self.memory.findings() if f["id"] == proposal.finding_id), None)
-        if not self.policy.authority.modify:
-            payload = {"finding_id": proposal.finding_id, "status": "policy_denied", "path": proposal.path, "validation": None, "rollback_available": False, "reason": "Policy authority does not grant MODIFY; no write was attempted."}
+        if finding is None:
+            payload = {"finding_id": proposal.finding_id, "status": "policy_denied", "path": proposal.path, "validation": None, "rollback_available": False, "reason": "Finding is not present in durable memory; remediation is denied conservatively."}
             self.memory.remember("remediation_denied", payload)
             return payload
-        if finding is not None and finding.get("severity") not in {"high", "critical"}:
-            payload = {"finding_id": proposal.finding_id, "status": "policy_denied", "path": proposal.path, "validation": None, "rollback_available": False, "reason": "Configured remediation policy only permits MODIFY for high or critical findings."}
+        if not self.policy.can_remediate_record(finding):
+            payload = {"finding_id": proposal.finding_id, "status": "policy_denied", "path": proposal.path, "validation": None, "rollback_available": False, "reason": "Policy does not grant MODIFY authority for this finding."}
             self.memory.remember("remediation_denied", payload)
             return payload
         outcome = self.remediation_loop.execute(proposal, approved=approved, validate=validate)
         payload = outcome.to_dict()
         self.memory.remember("remediation_outcome", payload)
-        if outcome.status == "accepted":
-            self.memory.remember("project_changed", {"finding_id": proposal.finding_id, "path": proposal.path, "status": "accepted"})
-        elif outcome.status == "rolled_back":
-            self.memory.remember("project_changed", {"finding_id": proposal.finding_id, "path": proposal.path, "status": "rolled_back"})
+        if outcome.status in {"accepted", "rolled_back", "rollback_blocked"}:
+            self.memory.remember("project_changed", {"finding_id": proposal.finding_id, "path": proposal.path, "status": outcome.status})
         return payload
 
     def _project_finding(self, finding) -> None:
