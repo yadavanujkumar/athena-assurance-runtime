@@ -6,11 +6,13 @@ from pathlib import Path
 from .ai_graph import AIGraphBuilder
 from .assurance import AssuranceEngine
 from .change import ChangeAnalyzer
+from .dependency_graph import DependencyGraphBuilder
 from .detectors import default_detectors
 from .graph import KnowledgeGraph
 from .investigation import InvestigationEngine
+from .lifecycle import FindingLifecycle
 from .memory import Memory
-from .models import Objective
+from .models import Objective, Relationship
 from .planner import Planner
 from .policy import Authority, PolicyEngine
 from .snapshot import Snapshotter
@@ -18,7 +20,6 @@ from .snapshot import Snapshotter
 
 class AthenaRuntime:
     """Local-first autonomous assurance runtime."""
-
     def __init__(self, root: str | Path, authority: Authority | None = None) -> None:
         self.root = Path(root).resolve()
         self.state = self.root / ".athena"
@@ -32,20 +33,25 @@ class AthenaRuntime:
         self.snapshotter = Snapshotter(self.root)
         self.change_analyzer = ChangeAnalyzer()
         self.ai_graph = AIGraphBuilder()
+        self.dependency_graph = DependencyGraphBuilder()
+        self.lifecycle = FindingLifecycle(self.memory)
 
     def initialize(self) -> None:
         self.state.mkdir(parents=True, exist_ok=True)
         self.graph.discover_project(self.root)
         ai_signals = self.ai_graph.build(self.graph, self.root)
+        dependencies = self.dependency_graph.build(self.graph, self.root)
         self.graph.save(self.graph_path)
         self.memory.fact("project.root", str(self.root))
         self.memory.fact("graph.entities", len(self.graph.entities))
+        self.memory.fact("graph.relationships", len(self.graph.relationships))
         self.memory.fact("ai.signals", ai_signals)
+        self.memory.fact("dependencies.graph", dependencies)
         if self.memory.fact("project.initialized") is None:
             snapshot = self.snapshotter.capture()
             self.memory.fact("project.snapshot", snapshot.fingerprint)
             self.memory.fact("project.initialized", True)
-            self.memory.remember("project_initialized", {"root": str(self.root), "entities": len(self.graph.entities), "ai_signals": len(ai_signals), "snapshot": snapshot.fingerprint})
+            self.memory.remember("project_initialized", {"root": str(self.root), "entities": len(self.graph.entities), "ai_signals": len(ai_signals), "dependencies": len(dependencies), "snapshot": snapshot.fingerprint})
 
     def set_objective(self, text: str) -> Objective:
         objective = Objective("O-" + hashlib.sha256(text.encode()).hexdigest()[:10].upper(), text)
@@ -57,12 +63,7 @@ class AthenaRuntime:
         rows = self.memory.objectives()
         if rows:
             return [{"id": r["id"], "text": r["text"], "source": "user"} for r in rows]
-        proposals = [
-            (100, "Establish a security and trust-boundary baseline for the project."),
-            (98, "Identify AI, agent, model, prompt and tool-use components and their risks."),
-            (95, "Identify dependency and software supply-chain exposure."),
-            (90, "Map discovered risks and evidence to applicable governance controls."),
-        ]
+        proposals = [(100, "Establish a security and trust-boundary baseline for the project."), (98, "Identify AI, agent, model, prompt and tool-use components and their risks."), (95, "Identify dependency and software supply-chain exposure."), (90, "Map discovered risks and evidence to applicable governance controls.")]
         return [{"priority": p, "text": t, "source": "athena"} for p, t in proposals]
 
     def _change_classes(self) -> tuple[list[dict], set[str]]:
@@ -91,7 +92,9 @@ class AthenaRuntime:
         for detector in default_detectors():
             for finding in detector.scan(self.root):
                 self.memory.add_finding(finding)
+                self._project_finding(finding)
                 results.append(self._finding_dict(finding) | {"recommended_action": self.policy.next_action(finding).value})
+        self.graph.save(self.graph_path)
         self.memory.remember("inspection", {"finding_count": len(results)})
         return results
 
@@ -102,19 +105,34 @@ class AthenaRuntime:
         tasks = self.autonomous_plan()
         selected = tasks[:5]
         cycle_objective = objective or (selected[0].reason if selected else "baseline assurance")
-        findings = []
-        investigation_results = []
+        findings, evidence = [], []
         for task in selected:
-            result = self.investigator.run(task.reason, task.kind)
-            investigation_results.append(result)
+            result = self.investigator.run(task.reason, task.kind, reconcile_lifecycle=False)
             findings.extend(result.findings)
-        validation = self.investigator.run("Validate the current project state with available tests.", "validation")
+            evidence.extend(result.evidence)
+        validation = self.investigator.run("Validate the current project state with available tests.", "validation", reconcile_lifecycle=False)
         findings.extend(validation.findings)
+        evidence.extend(validation.evidence)
+        for finding in findings:
+            self._project_finding(finding)
+        lifecycle = self.lifecycle.reconcile(findings)
         decisions = self.assurance.assess(findings)
         snapshot = self.snapshotter.capture()
         self.memory.fact("project.snapshot", snapshot.fingerprint)
-        self.memory.remember("autonomous_cycle", {"objective": cycle_objective, "tasks": [t.kind for t in selected], "findings": len(findings), "decisions": len(decisions), "validation_findings": len(validation.findings)})
-        return {"objective": cycle_objective, "plan": [{"kind": t.kind, "reason": t.reason, "priority": t.priority} for t in selected], "findings": [self._finding_dict(f) for f in findings], "decisions": [{"id": d.id, "finding_id": d.finding_id, "action": d.action.value, "approved": d.approved, "rationale": d.rationale} for d in decisions], "validation": [e.__dict__ if hasattr(e, "__dict__") else {"source": e.source, "kind": e.kind, "detail": e.detail} for e in validation.evidence], "snapshot": snapshot.fingerprint}
+        self.graph.save(self.graph_path)
+        self.memory.remember("autonomous_cycle", {"objective": cycle_objective, "tasks": [t.kind for t in selected], "findings": len(findings), "decisions": len(decisions), "evidence": len(evidence), "lifecycle": lifecycle})
+        return {"objective": cycle_objective, "plan": [{"kind": t.kind, "reason": t.reason, "priority": t.priority} for t in selected], "findings": [self._finding_dict(f) for f in findings], "decisions": [{"id": d.id, "finding_id": d.finding_id, "action": d.action.value, "approved": d.approved, "rationale": d.rationale} for d in decisions], "validation": [{"source": e.source, "kind": e.kind, "detail": e.detail} for e in validation.evidence], "snapshot": snapshot.fingerprint}
+
+    def _project_finding(self, finding) -> None:
+        entity = self.graph.upsert_entity("finding", finding.id, name=finding.id, attributes={"finding_id": finding.id, "title": finding.title, "severity": finding.severity.value, "confidence": finding.confidence, "status": finding.status})
+        evidence_text = " ".join(str(x) for x in finding.evidence).lower()
+        for candidate in self.graph.entities.values():
+            if candidate.kind in {"file", "python_file"} and candidate.path and candidate.path.lower() in evidence_text:
+                self.graph.add_relationship(Relationship(entity.id, "detected_in", candidate.id))
+            if candidate.kind == "dependency" and candidate.name.lower() in evidence_text:
+                self.graph.add_relationship(Relationship(entity.id, "affects", candidate.id))
+            if candidate.kind.startswith("ai_") and candidate.path and candidate.path.lower() in evidence_text:
+                self.graph.add_relationship(Relationship(entity.id, "targets", candidate.id))
 
     @staticmethod
     def _finding_dict(finding) -> dict:
