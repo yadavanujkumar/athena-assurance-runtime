@@ -45,3 +45,28 @@ def test_failed_work_retries_then_becomes_failed(tmp_path: Path) -> None:
     assert queue.get(item.id).status == "failed"
     queue.resume(item.id)
     assert queue.get(item.id).status == "queued"
+
+
+def test_running_work_recovers_after_restart(tmp_path: Path) -> None:
+    queue = make_queue(tmp_path)
+    item = queue.enqueue(kind="security", reason="Review", priority=90)
+    assert queue.claim_next().id == item.id
+
+    restarted = make_queue(tmp_path)
+    recovered = restarted.get(item.id)
+    assert recovered is not None
+    assert recovered.status == "queued"
+    assert "Recovered after runtime restart" in recovered.last_error
+
+
+def test_blocked_work_unblocks_when_dependencies_complete(tmp_path: Path) -> None:
+    queue = make_queue(tmp_path)
+    parent = queue.enqueue(kind="inspect", reason="Inspect", priority=100)
+    child = queue.enqueue(kind="assess", reason="Assess", priority=90, depends_on=(parent.id,))
+    queue.block(child.id, "waiting")
+    assert queue.unblock_ready() == []
+
+    queue.complete(parent.id)
+    ready = queue.unblock_ready()
+    assert [item.id for item in ready] == [child.id]
+    assert queue.get(child.id).status == "queued"
