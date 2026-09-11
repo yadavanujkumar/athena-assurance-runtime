@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .dependencies import DependencyAnalyzer
 from .detectors import default_detectors
+from .lifecycle import FindingLifecycle
 from .models import Finding, Severity, utc_now
 from .validation import ValidationEngine
 
@@ -34,6 +35,7 @@ class InvestigationEngine:
         self.governance = governance
         self.dependencies = DependencyAnalyzer()
         self.validation = ValidationEngine()
+        self.lifecycle = FindingLifecycle(memory)
 
     def run(self, objective: str, task_kind: str | None = None) -> InvestigationResult:
         evidence = [Evidence(str(self.root), "scope", objective)]
@@ -88,6 +90,8 @@ class InvestigationEngine:
                     for item in finding.evidence:
                         evidence.append(Evidence(item, "finding", finding.title))
 
+        lifecycle = self.lifecycle.reconcile(findings)
+        self.memory.remember("evidence_correlation", {"states": lifecycle, "evidence_count": len(evidence)})
         self.memory.remember("investigation_completed", {
             "objective": objective,
             "task_kind": kind,
