@@ -5,6 +5,7 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
+from .export import AssuranceExporter
 from .health import check_runtime
 from .runtime import AthenaRuntime
 from .watch import ProjectWatcher
@@ -30,6 +31,9 @@ def build_parser() -> argparse.ArgumentParser:
     cycle.add_argument("--objective", help="Explicit assurance objective")
     cycle.add_argument("--yes", action="store_true", help="Accept ATHENA's baseline objective without prompting")
     cycle.add_argument("--max-work", type=int, default=5)
+    export = sub.add_parser("export")
+    export.add_argument("path", nargs="?", default=".")
+    export.add_argument("-o", "--output", default=".athena/assurance-bundle.json")
     watch = sub.add_parser("watch")
     watch.add_argument("path", nargs="?", default=".")
     watch.add_argument("--interval", type=float, default=5.0)
@@ -63,7 +67,7 @@ def main(argv=None) -> int:
             runtime.initialize()
             print(f"ATHENA initialized: {runtime.root}")
         elif args.command == "inspect":
-            print(json.dumps([asdict(f) for f in runtime.inspect()], indent=2))
+            print(json.dumps([f.to_dict() if hasattr(f, "to_dict") else asdict(f) for f in runtime.inspect()], indent=2))
         elif args.command == "status":
             print(json.dumps(runtime.status(), indent=2))
         elif args.command == "health":
@@ -85,6 +89,12 @@ def main(argv=None) -> int:
             if objective is None and not args.yes:
                 objective = choose_objective(runtime)
             print(json.dumps(runtime.run_autonomous_cycle(objective, args.max_work), indent=2))
+        elif args.command == "export":
+            runtime.initialize()
+            output = Path(args.output)
+            if not output.is_absolute():
+                output = runtime.root / output
+            print(json.dumps({"path": str(AssuranceExporter(runtime).write(output))}, indent=2))
         elif args.command == "watch":
             def changed(fingerprint):
                 runtime.memory.remember("project_changed", {"fingerprint": fingerprint})
