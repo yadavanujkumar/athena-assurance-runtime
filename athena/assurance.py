@@ -4,15 +4,17 @@ import hashlib
 
 from .governance import GovernanceCatalog
 from .models import Action, Decision, Finding, Severity, utc_now
+from .remediation import RemediationPlanner
 
 
 class AssuranceEngine:
-    """Turns findings into risk decisions without silently granting write authority."""
+    """Turns findings into risk decisions and bounded remediation plans."""
 
     def __init__(self, memory, policy) -> None:
         self.memory = memory
         self.policy = policy
         self.governance = GovernanceCatalog()
+        self.remediation = RemediationPlanner()
 
     def assess(self, findings: list[Finding]) -> list[Decision]:
         decisions: list[Decision] = []
@@ -25,7 +27,13 @@ class AssuranceEngine:
             decision_id = "D-" + hashlib.sha256(f"{finding.id}:{action.value}".encode()).hexdigest()[:12].upper()
             decision = Decision(decision_id, finding.id, action, approved, rationale, utc_now())
             self.memory.add_decision(decision)
-            self.memory.remember("governance_mapping", {"finding_id": finding.id, "controls": self.governance.map_finding(finding)})
+            controls = self.governance.map_finding(finding)
+            plan = [
+                {"action": step.action, "rationale": step.rationale, "requires_approval": step.requires_approval}
+                for step in self.remediation.plan(finding, action)
+            ]
+            self.memory.remember("governance_mapping", {"finding_id": finding.id, "controls": controls})
+            self.memory.remember("remediation_plan", {"finding_id": finding.id, "decision_id": decision.id, "steps": plan})
             decisions.append(decision)
         return decisions
 
