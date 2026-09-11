@@ -29,6 +29,9 @@ class AssuranceEngine:
             decision_id = "D-" + hashlib.sha256(f"{finding.id}:{action.value}".encode()).hexdigest()[:12].upper()
             decision = Decision(decision_id, finding.id, action, approved, rationale, utc_now())
             self.memory.add_decision(decision)
+            if not approved and action in {Action.MODIFY, Action.BLOCK}:
+                request_id = "REQ-" + hashlib.sha256(f"{finding.id}:{action.value}".encode()).hexdigest()[:12].upper()
+                self.memory.create_decision_request(request_id, finding.id, action.value, rationale)
             controls = self.governance.map_finding(finding)
             plan = [{"action": step.action, "rationale": step.rationale, "requires_approval": step.requires_approval} for step in self.remediation.plan(finding, action)]
             self.memory.remember("governance_mapping", {"finding_id": finding.id, "controls": controls})
