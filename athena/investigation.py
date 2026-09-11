@@ -53,7 +53,16 @@ class InvestigationEngine:
                 self.memory.remember("dependency_audit", audit.to_dict())
                 for advisory in audit.findings:
                     name = advisory.get("name") or advisory.get("package") or "dependency"
-                    finding = Finding(f"DEP-{ecosystem}-{name}".replace(" ", "-")[:64], f"Dependency vulnerability: {name}", "An installed open-source dependency auditor reported a vulnerability or advisory.", Severity.HIGH, 0.9, [audit.tool, name], "Upgrade, replace or constrain the affected dependency and rerun the audit.")
+                    identifiers = advisory.get("identifiers") or advisory.get("id") or advisory.get("cve") or []
+                    if isinstance(identifiers, str):
+                        identifiers = [identifiers]
+                    identifier_text = ",".join(str(item) for item in identifiers) or "unidentified"
+                    severity = self._advisory_severity(advisory.get("severity"))
+                    stable_key = f"{ecosystem}:{name}:{identifier_text}:{advisory.get('vulnerable_range') or advisory.get('range') or ''}"
+                    stable_id = "DEP-" + hashlib.sha256(stable_key.encode()).hexdigest()[:14].upper()
+                    vulnerable = advisory.get("vulnerable_range") or advisory.get("range") or "unknown"
+                    fixed = advisory.get("fixed_version") or advisory.get("fixed") or "unknown"
+                    finding = Finding(stable_id, f"Dependency vulnerability: {name}", f"An installed open-source dependency auditor reported a {severity.value.lower()} vulnerability or advisory for {name}.", severity, 0.9, [audit.tool, name, identifier_text, vulnerable], f"Upgrade {name} to {fixed} when available, or replace/constrain the affected dependency, then rerun the audit.")
                     findings.append(finding)
                     self.memory.add_finding(finding)
             if deps and not findings:
@@ -78,6 +87,19 @@ class InvestigationEngine:
             self.memory.remember("evidence_correlation", {"states": lifecycle, "evidence_count": len(evidence)})
         self.memory.remember("investigation_completed", {"objective": objective, "task_kind": kind, "finding_count": len(findings), "critical_count": sum(f.severity is Severity.CRITICAL for f in findings), "high_count": sum(f.severity is Severity.HIGH for f in findings), "evidence_count": len(evidence)})
         return InvestigationResult(objective, findings, evidence)
+
+    @staticmethod
+    def _advisory_severity(value) -> Severity:
+        text = str(value or "").strip().lower()
+        if text in {"critical", "crit", "cvss:critical"}:
+            return Severity.CRITICAL
+        if text in {"high", "important", "severe"}:
+            return Severity.HIGH
+        if text in {"medium", "moderate"}:
+            return Severity.MEDIUM
+        if text in {"low", "minor"}:
+            return Severity.LOW
+        return Severity.HIGH
 
     @staticmethod
     def _infer_task(objective: str) -> str:
