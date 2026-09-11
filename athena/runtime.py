@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+from .ai_graph import AIGraphBuilder
 from .assurance import AssuranceEngine
 from .change import ChangeAnalyzer
 from .detectors import default_detectors
@@ -30,16 +31,19 @@ class AthenaRuntime:
         self.assurance = AssuranceEngine(self.memory, self.policy)
         self.snapshotter = Snapshotter(self.root)
         self.change_analyzer = ChangeAnalyzer()
+        self.ai_graph = AIGraphBuilder()
 
     def initialize(self) -> None:
         self.state.mkdir(parents=True, exist_ok=True)
         self.graph.discover_project(self.root)
+        ai_signals = self.ai_graph.build(self.graph, self.root)
         self.graph.save(self.graph_path)
         self.memory.fact("project.root", str(self.root))
         self.memory.fact("graph.entities", len(self.graph.entities))
+        self.memory.fact("ai.signals", ai_signals)
         snapshot = self.snapshotter.capture()
         self.memory.fact("project.snapshot", snapshot.fingerprint)
-        self.memory.remember("project_initialized", {"root": str(self.root), "entities": len(self.graph.entities), "snapshot": snapshot.fingerprint})
+        self.memory.remember("project_initialized", {"root": str(self.root), "entities": len(self.graph.entities), "ai_signals": len(ai_signals), "snapshot": snapshot.fingerprint})
 
     def set_objective(self, text: str) -> Objective:
         objective = Objective("O-" + hashlib.sha256(text.encode()).hexdigest()[:10].upper(), text)
@@ -62,16 +66,12 @@ class AthenaRuntime:
     def _change_classes(self) -> tuple[list[dict], set[str]]:
         previous = self.memory.fact("project.inventory")
         current = self.change_analyzer.inventory(self.root)
-        if previous:
-            previous = {k: tuple(v) for k, v in previous.items()}
-        else:
-            previous = {}
+        previous = {k: tuple(v) for k, v in previous.items()} if previous else {}
         changes = self.change_analyzer.compare(previous, current)
         classes = self.change_analyzer.classify(changes)
         self.memory.fact("project.inventory", current)
         if changes:
-            payload = {"changes": [{"path": c.path, "kind": c.kind} for c in changes], "classes": sorted(classes)}
-            self.memory.remember("project_drift", payload)
+            self.memory.remember("project_drift", {"changes": [{"path": c.path, "kind": c.kind} for c in changes], "classes": sorted(classes)})
         return ([{"path": c.path, "kind": c.kind} for c in changes], classes)
 
     def autonomous_plan(self):
