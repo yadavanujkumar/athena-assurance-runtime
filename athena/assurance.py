@@ -37,9 +37,18 @@ class AssuranceEngine:
         return decisions
 
     def _action_for_context(self, finding: Finding, context: dict) -> Action:
-        """Let high-confidence graph risk influence action while remaining inside policy authority."""
+        """Use lifecycle and graph risk to prioritize action inside policy authority."""
         action = self.policy.next_action(finding)
         band = str(context.get("risk_band", "")).lower()
+        lifecycle = str((context.get("lifecycle") or {}).get("state", "new")).lower()
+        if lifecycle == "resolved":
+            return Action.OBSERVE if self.policy.can_execute(Action.OBSERVE) else action
+        if lifecycle in {"reopened", "worsening"} and band in {"critical", "high"}:
+            if self.policy.can_execute(Action.INVESTIGATE):
+                return Action.INVESTIGATE
+        if lifecycle == "new" and band in {"critical", "high"}:
+            if self.policy.can_execute(Action.INVESTIGATE):
+                return Action.INVESTIGATE
         if band == "critical" and self.policy.authority.block:
             return Action.BLOCK
         if band in {"critical", "high"} and self.policy.authority.modify and action is Action.RECOMMEND:
@@ -49,12 +58,23 @@ class AssuranceEngine:
     @staticmethod
     def _rationale(finding: Finding, action: Action, context: dict | None) -> str:
         prefix = ""
+        lifecycle = str((context or {}).get("lifecycle", {}).get("state", "unknown"))
         if context:
             prefix = f"Graph context identifies {len(context.get('affected_components', []))} affected component(s) with risk band {context.get('risk_band', 'unknown')}. "
+            if lifecycle != "unknown":
+                prefix += f"Lifecycle state is {lifecycle}. "
             if context.get("supply_chain_risk"):
                 prefix += f"Supply-chain advisory risk is {context['supply_chain_risk']}/100. "
             if context.get("uncertainties"):
                 prefix += "Uncertainty remains, so validation is required. "
+        if lifecycle == "resolved":
+            return prefix + "The finding is resolved; assurance is limited to observation and recurrence detection."
+        if lifecycle == "reopened":
+            return prefix + "The finding has regressed after resolution; immediate investigation is warranted."
+        if lifecycle == "worsening":
+            return prefix + "The finding is worsening; assurance escalates investigation before remediation."
+        if lifecycle == "recurring":
+            return prefix + "The finding is recurring; avoid redundant investigation unless evidence or risk changes."
         if action is Action.MODIFY:
             return prefix + "Modification authority is enabled; execution must still pass validation gates."
         if action is Action.BLOCK:
