@@ -88,13 +88,11 @@ class AthenaRuntime:
         return ([{"path": c.path, "kind": c.kind} for c in changes], classes)
 
     def _sync_work(self, tasks, objective: str | None, changes: list[dict]) -> None:
-        """Materialize the current plan without duplicating durable work."""
         context = hashlib.sha256(str(changes).encode()).hexdigest()[:12] if changes else "stable"
         ids: dict[str, str] = {}
         for task in tasks:
             dependency_ids = tuple(ids[d] for d in task.depends_on if d in ids)
-            item = self.work.enqueue(kind=task.kind, reason=task.reason, priority=task.priority,
-                                     objective=objective, depends_on=dependency_ids, context_key=context)
+            item = self.work.enqueue(kind=task.kind, reason=task.reason, priority=task.priority, objective=objective, depends_on=dependency_ids, context_key=context)
             ids[task.kind] = item.id
         self.memory.fact("work.pending", [item.to_dict() for item in self.work.pending()])
 
@@ -178,7 +176,6 @@ class AthenaRuntime:
         return {"objective": active_objective, "plan": [{"kind": t.kind, "reason": t.reason, "priority": t.priority} for t in tasks], "work": [item.to_dict() for item in selected], "pending_work": [item.to_dict() for item in pending], "findings": [self._finding_dict(f) for f in findings], "reasoning": reasoning, "remediation_proposals": remediation, "decisions": [{"id": d.id, "finding_id": d.finding_id, "action": d.action.value, "approved": d.approved, "rationale": d.rationale} for d in decisions], "validation": [{"source": e.source, "kind": e.kind, "detail": e.detail} for e in validation.evidence], "snapshot": snapshot.fingerprint}
 
     def resume(self, max_work: int = 5) -> dict:
-        """Resume durable queued/blocked/failed work without rebuilding a new objective."""
         self.work.resume()
         return self.run_autonomous_cycle(max_work=max_work)
 
@@ -187,7 +184,16 @@ class AthenaRuntime:
         return [item.to_dict() for item in items]
 
     def remediate(self, proposal, *, approved: bool = False, validate: bool = True) -> dict:
-        """Execute one previously generated proposal through the approval and validation gates."""
+        """Execute a proposal only when both human approval and policy MODIFY authority permit it."""
+        finding = next((f for f in self.memory.findings() if f["id"] == proposal.finding_id), None)
+        if not self.policy.authority.modify:
+            payload = {"finding_id": proposal.finding_id, "status": "policy_denied", "path": proposal.path, "validation": None, "rollback_available": False, "reason": "Policy authority does not grant MODIFY; no write was attempted."}
+            self.memory.remember("remediation_denied", payload)
+            return payload
+        if finding is not None and finding.get("severity") not in {"high", "critical"}:
+            payload = {"finding_id": proposal.finding_id, "status": "policy_denied", "path": proposal.path, "validation": None, "rollback_available": False, "reason": "Configured remediation policy only permits MODIFY for high or critical findings."}
+            self.memory.remember("remediation_denied", payload)
+            return payload
         outcome = self.remediation_loop.execute(proposal, approved=approved, validate=validate)
         payload = outcome.to_dict()
         self.memory.remember("remediation_outcome", payload)
