@@ -7,6 +7,7 @@ from .ai_graph import AIGraphBuilder
 from .ai_inventory import AIInventory
 from .assurance import AssuranceEngine
 from .change import ChangeAnalyzer
+from .config import RuntimeConfig
 from .dependencies import DependencyAnalyzer
 from .dependency_graph import DependencyGraphBuilder
 from .evidence import EvidenceLedger
@@ -33,6 +34,8 @@ class AthenaRuntime:
         self.root = root
         self.athena_dir = root / ".athena"
         self.athena_dir.mkdir(exist_ok=True)
+        self.config = RuntimeConfig.load(root)
+        configured_authority = Authority(**self.config.authority)
         self.db_path = self.athena_dir / "athena.db"
         self.graph_path = self.athena_dir / "graph.json"
         self.memory = MemoryStore(self.db_path)
@@ -46,7 +49,7 @@ class AthenaRuntime:
         self.validation = ValidationEngine(root)
         self.lifecycle = FindingLifecycle(self.memory)
         self.reasoning = ReasoningEngine(self.memory)
-        self.policy = PolicyEngine(authority)
+        self.policy = PolicyEngine(authority or configured_authority)
         self.assurance = AssuranceEngine(self.memory, self.policy)
         self.remediation = RemediationPlanner()
         self.remediation_loop = RemediationLoop(self.root, self.validation)
@@ -131,7 +134,7 @@ class AthenaRuntime:
             self.memory.remember("advisory_work_synced", {"count": len(created), "work_ids": [item.id for item in created]})
         return created
 
-    def run_autonomous_cycle(self, objective: str | None = None, max_work: int = 5) -> dict:
+    def run_autonomous_cycle(self, objective: str | None = None, max_work: int | None = None) -> dict:
         self.initialize()
         if objective:
             self.set_objective(objective)
@@ -145,13 +148,14 @@ class AthenaRuntime:
         findings, evidence = [], []
         self.work.unblock_ready()
         self.leases.reclaim_expired()
-        for _ in range(max_work):
-            work_item = self.work.claim_next()
+        cycle_limit = self.config.max_work_per_cycle if max_work is None else max(1, int(max_work))
+        for _ in range(cycle_limit):
+            work_item = self.work.claim_next(max_attempts=self.config.max_attempts)
             if work_item is None:
                 break
-            lease = self.leases.acquire(work_item.id)
+            lease = self.leases.acquire(work_item.id, ttl_seconds=self.config.lease_ttl_seconds)
             if lease is None:
-                self.work.fail(work_item.id, "Work lease is held by another active worker.", retry=True)
+                self.work.fail(work_item.id, "Work lease is held by another active worker.", retry=True, max_attempts=self.config.max_attempts)
                 continue
             selected.append(work_item)
             try:
@@ -161,13 +165,14 @@ class AthenaRuntime:
                 self.work.complete(work_item.id)
                 self.memory.remember("work_completed", {"work_id": work_item.id, "kind": work_item.kind, "attempts": work_item.attempts, "findings": len(result.findings), "evidence": len(result.evidence), "worker": lease.owner})
             except Exception as exc:
-                self.work.fail(work_item.id, f"{type(exc).__name__}: {exc}")
+                self.work.fail(work_item.id, f"{type(exc).__name__}: {exc}", max_attempts=self.config.max_attempts)
                 self.memory.remember("work_failed", {"work_id": work_item.id, "kind": work_item.kind, "error": str(exc), "worker": lease.owner})
             finally:
                 self.leases.release(work_item.id)
-        validation = self.investigator.run("Validate the current project state with available tests.", "validation", reconcile_lifecycle=False)
-        findings.extend(validation.findings)
-        evidence.extend(validation.evidence)
+        validation = self.investigator.run("Validate the current project state with available tests.", "validation", reconcile_lifecycle=False) if self.config.validation_enabled else None
+        if validation:
+            findings.extend(validation.findings)
+            evidence.extend(validation.evidence)
         lifecycle = self.lifecycle.reconcile(findings)
         reasoning = []
         remediation = []
@@ -190,9 +195,9 @@ class AthenaRuntime:
         self.memory.fact("work.pending", [item.to_dict() for item in pending])
         self.memory.remember("autonomous_cycle", {"objective": active_objective, "tasks": [item.kind for item in selected], "advisory_work": [item.id for item in advisory_work], "findings": len(findings), "decisions": len(decisions), "evidence": len(evidence), "remediation_proposals": len(remediation), "lifecycle": lifecycle, "pending_work": len(pending)})
         self.graph.save(self.graph_path)
-        return {"objective": active_objective, "plan": [{"kind": t.kind, "reason": t.reason, "priority": t.priority} for t in tasks], "work": [item.to_dict() for item in selected], "pending_work": [item.to_dict() for item in pending], "findings": [self._finding_dict(f) for f in findings], "reasoning": reasoning, "remediation_proposals": remediation, "decisions": [{"id": d.id, "finding_id": d.finding_id, "action": d.action.value, "approved": d.approved, "rationale": d.rationale} for d in decisions], "validation": [{"source": e.source, "kind": e.kind, "detail": e.detail} for e in validation.evidence], "snapshot": snapshot.fingerprint}
+        return {"objective": active_objective, "plan": [{"kind": t.kind, "reason": t.reason, "priority": t.priority} for t in tasks], "work": [item.to_dict() for item in selected], "pending_work": [item.to_dict() for item in pending], "findings": [self._finding_dict(f) for f in findings], "reasoning": reasoning, "remediation_proposals": remediation, "decisions": [{"id": d.id, "finding_id": d.finding_id, "action": d.action.value, "approved": d.approved, "rationale": d.rationale} for d in decisions], "validation": ([{"source": e.source, "kind": e.kind, "detail": e.detail} for e in validation.evidence] if validation else []), "snapshot": snapshot.fingerprint}
 
-    def resume(self, max_work: int = 5) -> dict:
+    def resume(self, max_work: int | None = None) -> dict:
         self.work.resume()
         return self.run_autonomous_cycle(max_work=max_work)
 
@@ -239,7 +244,7 @@ class AthenaRuntime:
         return {"id": finding.id, "title": finding.title, "description": finding.description, "severity": finding.severity.value, "confidence": finding.confidence, "evidence": finding.evidence, "remediation": finding.remediation, "status": finding.status}
 
     def status(self) -> dict:
-        return {"root": str(self.root), "graph_entities": len(self.graph.entities), "graph_relationships": len(self.graph.relationships), "objectives": self.memory.objectives(), "findings": self.memory.findings(), "work": self.work_status(), "recent_events": self.memory.recent_events()}
+        return {"root": str(self.root), "graph_entities": len(self.graph.entities), "graph_relationships": len(self.graph.relationships), "objectives": self.memory.objectives(), "findings": self.memory.findings(), "work": self.work_status(), "recent_events": self.memory.recent_events(), "config": {"max_work_per_cycle": self.config.max_work_per_cycle, "max_attempts": self.config.max_attempts, "lease_ttl_seconds": self.config.lease_ttl_seconds, "validation_enabled": self.config.validation_enabled, "authority": dict(self.config.authority)}}
 
     def close(self) -> None:
         self.memory.close()
