@@ -19,6 +19,9 @@ class Planner:
     def plan(self, objective: Objective | None, graph, findings: list[dict], change_classes: set[str] | None = None) -> list[InvestigationTask]:
         tasks: list[InvestigationTask] = []
         change_classes = change_classes or set()
+        advisory_risks = [int((e.attributes or {}).get("risk", 0) or 0) for e in graph.entities.values() if e.kind == "advisory"]
+        max_advisory_risk = max(advisory_risks, default=0)
+        advisory_count = len(advisory_risks)
         if objective:
             text = objective.text.lower()
             tasks.append(InvestigationTask("scope_objective", f"Translate objective into evidence requirements: {objective.text}", 100))
@@ -42,6 +45,15 @@ class Planner:
             if findings:
                 tasks.append(InvestigationTask("finding_triage", f"Re-evaluate {len(findings)} persisted findings against current project evidence.", 97))
             tasks.append(InvestigationTask("governance_review", "Map discovered risks to applicable governance controls.", 85))
+
+        # Active advisory exposure overrides the generic dependency priority.
+        if max_advisory_risk:
+            priority = 125 if max_advisory_risk >= 80 else 118 if max_advisory_risk >= 55 else 108
+            tasks.append(InvestigationTask(
+                "dependency_review",
+                f"Active dependency advisories detected ({advisory_count}); highest normalized supply-chain risk is {max_advisory_risk}/100.",
+                priority,
+            ))
 
         # Drift overrides the generic baseline: changed surfaces get focused assurance first.
         focused: list[InvestigationTask] = []
