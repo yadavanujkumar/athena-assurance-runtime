@@ -14,6 +14,12 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("init", "inspect", "status", "findings", "plan"):
         cmd = sub.add_parser(name)
         cmd.add_argument("path", nargs="?", default=".")
+    work = sub.add_parser("work")
+    work.add_argument("path", nargs="?", default=".")
+    work.add_argument("--all", action="store_true", help="Include completed work")
+    resume = sub.add_parser("resume")
+    resume.add_argument("path", nargs="?", default=".")
+    resume.add_argument("--max-work", type=int, default=5)
     objective = sub.add_parser("objective")
     objective.add_argument("text")
     objective.add_argument("path", nargs="?", default=".")
@@ -21,6 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     cycle.add_argument("path", nargs="?", default=".")
     cycle.add_argument("--objective", help="Explicit assurance objective")
     cycle.add_argument("--yes", action="store_true", help="Accept ATHENA's baseline objective without prompting")
+    cycle.add_argument("--max-work", type=int, default=5)
     watch = sub.add_parser("watch")
     watch.add_argument("path", nargs="?", default=".")
     watch.add_argument("--interval", type=float, default=5.0)
@@ -60,6 +67,10 @@ def main(argv=None) -> int:
             print(json.dumps(runtime.status(), indent=2))
         elif args.command == "findings":
             print(json.dumps(runtime.memory.findings(), indent=2))
+        elif args.command == "work":
+            print(json.dumps(runtime.work_status(args.all), indent=2))
+        elif args.command == "resume":
+            print(json.dumps(runtime.resume(args.max_work), indent=2))
         elif args.command == "objective":
             objective = runtime.set_objective(args.text)
             print(json.dumps({"id": objective.id, "text": objective.text}, indent=2))
@@ -69,7 +80,7 @@ def main(argv=None) -> int:
             objective = args.objective
             if objective is None and not args.yes:
                 objective = choose_objective(runtime)
-            print(json.dumps(runtime.run_autonomous_cycle(objective), indent=2))
+            print(json.dumps(runtime.run_autonomous_cycle(objective, args.max_work), indent=2))
         elif args.command == "watch":
             def changed(fingerprint):
                 runtime.memory.remember("project_changed", {"fingerprint": fingerprint})
