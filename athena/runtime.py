@@ -11,6 +11,7 @@ from .memory import Memory
 from .models import Objective
 from .planner import Planner
 from .policy import Authority, PolicyEngine
+from .snapshot import Snapshotter
 
 
 class AthenaRuntime:
@@ -26,6 +27,7 @@ class AthenaRuntime:
         self.planner = Planner()
         self.investigator = InvestigationEngine(self.root, self.memory)
         self.assurance = AssuranceEngine(self.memory, self.policy)
+        self.snapshotter = Snapshotter(self.root)
 
     def initialize(self) -> None:
         self.state.mkdir(parents=True, exist_ok=True)
@@ -33,61 +35,47 @@ class AthenaRuntime:
         self.graph.save(self.graph_path)
         self.memory.fact("project.root", str(self.root))
         self.memory.fact("graph.entities", len(self.graph.entities))
-        self.memory.remember(
-            "project_initialized", {"root": str(self.root), "entities": len(self.graph.entities)}
-        )
+        snapshot = self.snapshotter.capture()
+        self.memory.fact("project.snapshot", snapshot.fingerprint)
+        self.memory.remember("project_initialized", {"root": str(self.root), "entities": len(self.graph.entities), "snapshot": snapshot.fingerprint})
 
     def set_objective(self, text: str) -> Objective:
         objective = Objective("O-" + hashlib.sha256(text.encode()).hexdigest()[:10].upper(), text)
         self.memory.add_objective(objective)
         return objective
 
+    def proposed_objectives(self) -> list[dict]:
+        self.initialize()
+        rows = self.memory.objectives()
+        if rows:
+            return [{"id": r["id"], "text": r["text"], "source": "user"} for r in rows]
+        proposals = [
+            (100, "Establish a security and trust-boundary baseline for the project."),
+            (98, "Identify AI, agent, model, prompt and tool-use components and their risks."),
+            (95, "Identify dependency and software supply-chain exposure."),
+            (90, "Map discovered risks and evidence to applicable governance controls."),
+        ]
+        return [{"priority": p, "text": t, "source": "athena"} for p, t in proposals]
+
     def autonomous_plan(self):
         self.initialize()
         rows = self.memory.objectives()
-        objective = (
-            Objective(rows[0]["id"], rows[0]["text"], rows[0]["status"], rows[0]["created_at"])
-            if rows
-            else None
-        )
+        objective = Objective(rows[0]["id"], rows[0]["text"], rows[0]["status"], rows[0]["created_at"]) if rows else None
         tasks = self.planner.plan(objective, self.graph, self.memory.findings())
-        self.memory.remember(
-            "plan",
-            {
-                "objective": objective.text if objective else None,
-                "tasks": [
-                    {"kind": t.kind, "reason": t.reason, "priority": t.priority}
-                    for t in tasks
-                ],
-            },
-        )
+        self.memory.remember("plan", {"objective": objective.text if objective else None, "tasks": [{"kind": t.kind, "reason": t.reason, "priority": t.priority} for t in tasks]})
         return tasks
 
     def inspect(self) -> list[dict]:
-        """Run deterministic detectors and persist every finding as durable evidence."""
         self.initialize()
         results = []
         for detector in default_detectors():
             for finding in detector.scan(self.root):
                 self.memory.add_finding(finding)
-                results.append(
-                    {
-                        "id": finding.id,
-                        "title": finding.title,
-                        "description": finding.description,
-                        "severity": finding.severity.value,
-                        "confidence": finding.confidence,
-                        "evidence": finding.evidence,
-                        "remediation": finding.remediation,
-                        "status": finding.status,
-                        "recommended_action": self.policy.next_action(finding).value,
-                    }
-                )
+                results.append(self._finding_dict(finding) | {"recommended_action": self.policy.next_action(finding).value})
         self.memory.remember("inspection", {"finding_count": len(results)})
         return results
 
     def run_autonomous_cycle(self, objective: str | None = None) -> dict:
-        """Discover, plan, investigate, assess and persist one bounded assurance cycle."""
         self.initialize()
         if objective:
             self.set_objective(objective)
@@ -96,53 +84,21 @@ class AthenaRuntime:
         cycle_objective = objective or (selected[0].reason if selected else "baseline assurance")
         result = self.investigator.run(cycle_objective)
         decisions = self.assurance.assess(result.findings)
-        self.memory.remember(
-            "autonomous_cycle",
-            {
-                "objective": cycle_objective,
-                "tasks": [task.kind for task in selected],
-                "findings": len(result.findings),
-                "decisions": len(decisions),
-            },
-        )
-        return {
-            "objective": cycle_objective,
-            "plan": [task.__dict__ if hasattr(task, "__dict__") else {"kind": task.kind, "reason": task.reason, "priority": task.priority} for task in selected],
-            "findings": [self._finding_dict(f) for f in result.findings],
-            "decisions": [
-                {
-                    "id": d.id,
-                    "finding_id": d.finding_id,
-                    "action": d.action.value,
-                    "approved": d.approved,
-                    "rationale": d.rationale,
-                }
-                for d in decisions
-            ],
-        }
+        snapshot = self.snapshotter.capture()
+        previous = self.memory.fact("project.snapshot")
+        changed = previous is not None and previous != snapshot.fingerprint
+        self.memory.fact("project.snapshot", snapshot.fingerprint)
+        if changed:
+            self.memory.remember("project_changed", {"previous_snapshot": previous, "current_snapshot": snapshot.fingerprint})
+        self.memory.remember("autonomous_cycle", {"objective": cycle_objective, "tasks": [t.kind for t in selected], "findings": len(result.findings), "decisions": len(decisions), "changed": changed})
+        return {"objective": cycle_objective, "plan": [{"kind": t.kind, "reason": t.reason, "priority": t.priority} for t in selected], "findings": [self._finding_dict(f) for f in result.findings], "decisions": [{"id": d.id, "finding_id": d.finding_id, "action": d.action.value, "approved": d.approved, "rationale": d.rationale} for d in decisions], "snapshot": snapshot.fingerprint, "changed": changed}
 
     @staticmethod
     def _finding_dict(finding) -> dict:
-        return {
-            "id": finding.id,
-            "title": finding.title,
-            "description": finding.description,
-            "severity": finding.severity.value,
-            "confidence": finding.confidence,
-            "evidence": finding.evidence,
-            "remediation": finding.remediation,
-            "status": finding.status,
-        }
+        return {"id": finding.id, "title": finding.title, "description": finding.description, "severity": finding.severity.value, "confidence": finding.confidence, "evidence": finding.evidence, "remediation": finding.remediation, "status": finding.status}
 
     def status(self) -> dict:
-        return {
-            "root": str(self.root),
-            "graph_entities": len(self.graph.entities),
-            "graph_relationships": len(self.graph.relationships),
-            "objectives": self.memory.objectives(),
-            "findings": self.memory.findings(),
-            "recent_events": self.memory.recent_events(),
-        }
+        return {"root": str(self.root), "graph_entities": len(self.graph.entities), "graph_relationships": len(self.graph.relationships), "objectives": self.memory.objectives(), "findings": self.memory.findings(), "recent_events": self.memory.recent_events()}
 
     def close(self) -> None:
         self.memory.close()
