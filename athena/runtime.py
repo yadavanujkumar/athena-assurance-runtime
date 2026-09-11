@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import uuid
 
 from .ai_graph import AIGraphBuilder
 from .ai_inventory import AIInventory
@@ -15,7 +16,7 @@ from .graph import ProjectGraph, Relationship
 from .investigation import Investigator
 from .lifecycle import FindingLifecycle
 from .memory import MemoryStore
-from .models import Action, Finding, Objective, utc_now
+from .models import Finding, Objective, utc_now
 from .planner import Planner
 from .policy import Authority, PolicyEngine
 from .remediation import RemediationPlanner
@@ -57,7 +58,8 @@ class AthenaRuntime:
         self.snapshotter = Snapshotter(root)
         self.evidence = EvidenceLedger()
         self.work = WorkQueue(self.memory.db)
-        self.leases = WorkLeaseStore(self.memory.db, owner=f"pid:{os.getpid()}")
+        self.worker_id = f"pid:{os.getpid()}:{uuid.uuid4().hex[:12]}"
+        self.leases = WorkLeaseStore(self.memory.db, owner=self.worker_id)
 
     def initialize(self) -> None:
         self.graph.load(self.graph_path)
@@ -67,7 +69,11 @@ class AthenaRuntime:
         self.graph.save(self.graph_path)
 
     def set_objective(self, text: str) -> Objective:
-        objective = Objective("OBJ-" + hashlib.sha256(text.encode()).hexdigest()[:12].upper(), text, utc_now())
+        objective = Objective(
+            id="OBJ-" + hashlib.sha256(text.encode()).hexdigest()[:12].upper(),
+            text=text,
+            created_at=utc_now(),
+        )
         self.memory.add_objective(objective)
         return objective
 
@@ -193,7 +199,7 @@ class AthenaRuntime:
         self.memory.fact("project.snapshot", snapshot.fingerprint)
         pending = self.work.pending()
         self.memory.fact("work.pending", [item.to_dict() for item in pending])
-        self.memory.remember("autonomous_cycle", {"objective": active_objective, "tasks": [item.kind for item in selected], "advisory_work": [item.id for item in advisory_work], "findings": len(findings), "decisions": len(decisions), "evidence": len(evidence), "remediation_proposals": len(remediation), "lifecycle": lifecycle, "pending_work": len(pending)})
+        self.memory.remember("autonomous_cycle", {"objective": active_objective, "tasks": [item.kind for item in selected], "advisory_work": [item.id for item in advisory_work], "findings": len(findings), "decisions": len(decisions), "evidence": len(evidence), "remediation_proposals": len(remediation), "lifecycle": lifecycle, "pending_work": len(pending), "worker": self.worker_id})
         self.graph.save(self.graph_path)
         return {"objective": active_objective, "plan": [{"kind": t.kind, "reason": t.reason, "priority": t.priority} for t in tasks], "work": [item.to_dict() for item in selected], "pending_work": [item.to_dict() for item in pending], "findings": [self._finding_dict(f) for f in findings], "reasoning": reasoning, "remediation_proposals": remediation, "decisions": [{"id": d.id, "finding_id": d.finding_id, "action": d.action.value, "approved": d.approved, "rationale": d.rationale} for d in decisions], "validation": ([{"source": e.source, "kind": e.kind, "detail": e.detail} for e in validation.evidence] if validation else []), "snapshot": snapshot.fingerprint}
 
@@ -244,7 +250,7 @@ class AthenaRuntime:
         return {"id": finding.id, "title": finding.title, "description": finding.description, "severity": finding.severity.value, "confidence": finding.confidence, "evidence": finding.evidence, "remediation": finding.remediation, "status": finding.status}
 
     def status(self) -> dict:
-        return {"root": str(self.root), "graph_entities": len(self.graph.entities), "graph_relationships": len(self.graph.relationships), "objectives": self.memory.objectives(), "findings": self.memory.findings(), "work": self.work_status(), "recent_events": self.memory.recent_events(), "config": {"max_work_per_cycle": self.config.max_work_per_cycle, "max_attempts": self.config.max_attempts, "lease_ttl_seconds": self.config.lease_ttl_seconds, "validation_enabled": self.config.validation_enabled, "authority": dict(self.config.authority)}}
+        return {"root": str(self.root), "graph_entities": len(self.graph.entities), "graph_relationships": len(self.graph.relationships), "objectives": self.memory.objectives(), "findings": self.memory.findings(), "work": self.work_status(), "recent_events": self.memory.recent_events(), "config": {"max_work_per_cycle": self.config.max_work_per_cycle, "max_attempts": self.config.max_attempts, "lease_ttl_seconds": self.config.lease_ttl_seconds, "validation_enabled": self.config.validation_enabled, "authority": dict(self.config.authority)}, "worker": self.worker_id}
 
     def close(self) -> None:
         self.memory.close()
