@@ -20,11 +20,12 @@ class AssuranceEngine:
         decisions: list[Decision] = []
         reasoning = reasoning or {}
         for finding in findings:
-            action = self.policy.next_action(finding)
+            context = reasoning.get(finding.id) or {}
+            action = self._action_for_context(finding, context)
             approved = action in {Action.OBSERVE, Action.INVESTIGATE, Action.RECOMMEND}
-            if finding.severity is Severity.CRITICAL and not self.policy.authority.block:
+            if action is Action.BLOCK or finding.severity is Severity.CRITICAL and not self.policy.authority.block:
                 approved = False
-            rationale = self._rationale(finding, action, reasoning.get(finding.id))
+            rationale = self._rationale(finding, action, context)
             decision_id = "D-" + hashlib.sha256(f"{finding.id}:{action.value}".encode()).hexdigest()[:12].upper()
             decision = Decision(decision_id, finding.id, action, approved, rationale, utc_now())
             self.memory.add_decision(decision)
@@ -35,17 +36,29 @@ class AssuranceEngine:
             decisions.append(decision)
         return decisions
 
+    def _action_for_context(self, finding: Finding, context: dict) -> Action:
+        """Let high-confidence graph risk influence action while remaining inside policy authority."""
+        action = self.policy.next_action(finding)
+        band = str(context.get("risk_band", "")).lower()
+        if band == "critical" and self.policy.authority.block:
+            return Action.BLOCK
+        if band in {"critical", "high"} and self.policy.authority.modify and action is Action.RECOMMEND:
+            return Action.MODIFY
+        return action
+
     @staticmethod
     def _rationale(finding: Finding, action: Action, context: dict | None) -> str:
         prefix = ""
         if context:
             prefix = f"Graph context identifies {len(context.get('affected_components', []))} affected component(s) with risk band {context.get('risk_band', 'unknown')}. "
+            if context.get("supply_chain_risk"):
+                prefix += f"Supply-chain advisory risk is {context['supply_chain_risk']}/100. "
             if context.get("uncertainties"):
                 prefix += "Uncertainty remains, so validation is required. "
         if action is Action.MODIFY:
             return prefix + "Modification authority is enabled; execution must still pass validation gates."
         if action is Action.BLOCK:
             return prefix + "Critical risk meets the configured blocking threshold."
-        if finding.severity in {Severity.HIGH, Severity.CRITICAL}:
+        if finding.severity in {Severity.HIGH, Severity.CRITICAL} or context.get("risk_band") in {"high", "critical"}:
             return prefix + "High-impact risk is surfaced for human-controlled remediation."
         return prefix + "Low-impact finding can be investigated and recommended without write authority."
