@@ -7,12 +7,11 @@ from .ai_graph import AIGraphBuilder
 from .assurance import AssuranceEngine
 from .change import ChangeAnalyzer
 from .dependency_graph import DependencyGraphBuilder
-from .detectors import default_detectors
-from .graph import KnowledgeGraph
+from .graph import KnowledgeGraph, Relationship
 from .investigation import InvestigationEngine
 from .lifecycle import FindingLifecycle
 from .memory import Memory
-from .models import Objective, Relationship
+from .models import Objective
 from .planner import Planner
 from .policy import Authority, PolicyEngine
 from .reasoning import ReasoningEngine
@@ -24,12 +23,13 @@ from .work import WorkQueue
 
 class AthenaRuntime:
     """Local-first autonomous assurance runtime."""
+
     def __init__(self, root: str | Path, authority: Authority | None = None) -> None:
         self.root = Path(root).resolve()
         self.state = self.root / ".athena"
-        self.graph_path = self.state / "graph.json"
         self.memory = Memory(self.state / "memory.sqlite3")
-        self.graph = KnowledgeGraph.load(self.graph_path)
+        self.graph_path = self.state / "graph.json"
+        self.graph = KnowledgeGraph.load(self.graph_path) if self.graph_path.exists() else KnowledgeGraph()
         self.policy = PolicyEngine(authority)
         self.planner = Planner()
         self.investigator = InvestigationEngine(self.root, self.memory)
@@ -58,6 +58,7 @@ class AthenaRuntime:
         if self.memory.fact("project.initialized") is None:
             snapshot = self.snapshotter.capture()
             self.memory.fact("project.snapshot", snapshot.fingerprint)
+            self.memory.fact("project.inventory", self.change_analyzer.inventory(self.root))
             self.memory.fact("project.initialized", True)
             self.memory.remember("project_initialized", {"root": str(self.root), "entities": len(self.graph.entities), "ai_signals": len(ai_signals), "dependencies": len(dependencies), "snapshot": snapshot.fingerprint})
 
@@ -77,10 +78,10 @@ class AthenaRuntime:
     def _change_classes(self) -> tuple[list[dict], set[str]]:
         previous = self.memory.fact("project.inventory")
         current = self.change_analyzer.inventory(self.root)
-        previous = {k: tuple(v) for k, v in previous.items()} if previous else {}
+        previous = {k: tuple(v) if not isinstance(v, dict) else (v.get("sha256", ""), v.get("size", 0), v.get("mtime_ns", 0)) for k, v in previous.items()} if previous else {}
         changes = self.change_analyzer.compare(previous, current)
         classes = self.change_analyzer.classify(changes)
-        self.memory.fact("project.inventory", current)
+        self.memory.fact("project.inventory", {k: {"sha256": v.sha256, "size": v.size, "mtime_ns": v.mtime_ns} for k, v in current.items()})
         self.memory.fact("project.last_changes", [{"path": c.path, "kind": c.kind} for c in changes])
         self.memory.fact("project.last_change_classes", sorted(classes))
         if changes:
@@ -88,40 +89,23 @@ class AthenaRuntime:
         return ([{"path": c.path, "kind": c.kind} for c in changes], classes)
 
     def _sync_work(self, tasks, objective: str | None, changes: list[dict]) -> None:
-        context = hashlib.sha256(str(changes).encode()).hexdigest()[:12] if changes else "stable"
-        ids: dict[str, str] = {}
+        context_key = hashlib.sha256(repr(changes).encode()).hexdigest()[:16] if changes else "stable"
         for task in tasks:
-            dependency_ids = tuple(ids[d] for d in task.depends_on if d in ids)
-            item = self.work.enqueue(kind=task.kind, reason=task.reason, priority=task.priority, objective=objective, depends_on=dependency_ids, context_key=context)
-            ids[task.kind] = item.id
-        self.memory.fact("work.pending", [item.to_dict() for item in self.work.pending()])
+            self.work.enqueue(kind=task.kind, reason=task.reason, priority=task.priority, objective=objective, context_key=context_key)
 
-    def autonomous_plan(self):
-        self.initialize()
-        rows = self.memory.objectives()
-        objective = Objective(rows[0]["id"], rows[0]["text"], rows[0]["status"], rows[0]["created_at"]) if rows else None
+    def autonomous_plan(self, objective: str | None = None):
         changes, change_classes = self._change_classes()
-        tasks = self.planner.plan(objective, self.graph, self.memory.findings(), change_classes)
-        self._sync_work(tasks, objective.text if objective else None, changes)
-        self.memory.remember("plan", {"objective": objective.text if objective else None, "change_classes": sorted(change_classes), "tasks": [{"kind": t.kind, "reason": t.reason, "priority": t.priority} for t in tasks]})
+        tasks = self.planner.plan(objective or self._active_objective(), change_classes=change_classes)
+        self._sync_work(tasks, objective or self._active_objective(), changes)
         return tasks
 
-    def inspect(self) -> list[dict]:
+    def _active_objective(self) -> str | None:
+        rows = self.memory.objectives()
+        return rows[0]["text"] if rows else None
+
+    def inspect(self):
         self.initialize()
-        results = []
-        for detector in default_detectors():
-            for finding in detector.scan(self.root):
-                self.memory.add_finding(finding)
-                self._project_finding(finding)
-                reasoning = self.reasoning.reason(finding, self.graph)
-                proposal = self.remediation.propose(self.root, finding)
-                self.memory.remember("assurance_reasoning", reasoning.to_dict())
-                if proposal:
-                    self.memory.remember("remediation_proposal", {"finding_id": finding.id, "path": proposal.path, "before_sha256": proposal.before_sha256, "diff": proposal.diff, "rationale": proposal.rationale})
-                results.append(self._finding_dict(finding) | {"recommended_action": self.policy.next_action(finding).value, "reasoning": reasoning.to_dict(), "remediation_proposal": self._proposal_dict(proposal)})
-        self.graph.save(self.graph_path)
-        self.memory.remember("inspection", {"finding_count": len(results)})
-        return results
+        return self.investigator.run("Inspect the project for assurance findings.", "security_review").findings
 
     def run_autonomous_cycle(self, objective: str | None = None, max_work: int = 5) -> dict:
         self.initialize()
@@ -134,6 +118,7 @@ class AthenaRuntime:
         change_classes = set(self.memory.fact("project.last_change_classes") or [])
         selected = []
         findings, evidence = [], []
+        self.work.unblock_ready()
         for _ in range(max_work):
             work_item = self.work.claim_next()
             if work_item is None:
