@@ -1,82 +1,72 @@
 from __future__ import annotations
 
 import hashlib
-from pathlib import Path
 
 from .ai_graph import AIGraphBuilder
+from .ai_inventory import AIInventory
 from .assurance import AssuranceEngine
 from .change import ChangeAnalyzer
+from .dependencies import DependencyAnalyzer
 from .dependency_graph import DependencyGraphBuilder
-from .graph import KnowledgeGraph, Relationship
-from .investigation import InvestigationEngine
+from .evidence import EvidenceLedger
+from .graph import ProjectGraph, Relationship
+from .investigation import Investigator
 from .lifecycle import FindingLifecycle
-from .memory import Memory
-from .models import Objective
+from .memory import MemoryStore
+from .models import Action, Finding, Objective, utc_now
 from .planner import Planner
 from .policy import Authority, PolicyEngine
-from .reasoning import ReasoningEngine
-from .remediation import SafeRemediationEngine
+from .remediation import RemediationPlanner
 from .remediation_loop import RemediationLoop
+from .reasoning import ReasoningEngine
 from .snapshot import Snapshotter
+from .validation import ValidationEngine
 from .work import WorkQueue
 
 
 class AthenaRuntime:
     """Local-first autonomous assurance runtime."""
 
-    def __init__(self, root: str | Path, authority: Authority | None = None) -> None:
-        self.root = Path(root).resolve()
-        self.state = self.root / ".athena"
-        self.memory = Memory(self.state / "memory.sqlite3")
-        self.graph_path = self.state / "graph.json"
-        self.graph = KnowledgeGraph.load(self.graph_path) if self.graph_path.exists() else KnowledgeGraph()
-        self.policy = PolicyEngine(authority)
+    def __init__(self, root, *, authority: Authority | None = None) -> None:
+        self.root = root
+        self.athena_dir = root / ".athena"
+        self.athena_dir.mkdir(exist_ok=True)
+        self.db_path = self.athena_dir / "athena.db"
+        self.graph_path = self.athena_dir / "graph.json"
+        self.memory = MemoryStore(self.db_path)
+        self.graph = ProjectGraph()
         self.planner = Planner()
-        self.investigator = InvestigationEngine(self.root, self.memory)
-        self.assurance = AssuranceEngine(self.memory, self.policy)
-        self.snapshotter = Snapshotter(self.root)
-        self.change_analyzer = ChangeAnalyzer()
+        self.investigator = Investigator(root, self.graph, self.memory)
+        self.ai_inventory = AIInventory()
         self.ai_graph = AIGraphBuilder()
         self.dependency_graph = DependencyGraphBuilder()
+        self.dependency_analyzer = DependencyAnalyzer(root)
+        self.validation = ValidationEngine(root)
         self.lifecycle = FindingLifecycle(self.memory)
         self.reasoning = ReasoningEngine(self.memory)
-        self.remediation = SafeRemediationEngine()
-        self.remediation_loop = RemediationLoop(self.root, self.remediation)
+        self.policy = PolicyEngine(authority)
+        self.assurance = AssuranceEngine(self.memory, self.policy)
+        self.remediation = RemediationPlanner()
+        self.remediation_loop = RemediationLoop(self.root, self.validation)
+        self.change_analyzer = ChangeAnalyzer(root)
+        self.snapshotter = Snapshotter(root)
+        self.evidence = EvidenceLedger()
         self.work = WorkQueue(self.memory.db)
 
     def initialize(self) -> None:
-        self.state.mkdir(parents=True, exist_ok=True)
+        self.graph.load(self.graph_path)
         self.graph.discover_project(self.root)
-        ai_signals = self.ai_graph.build(self.graph, self.root)
-        dependencies = self.dependency_graph.build(self.graph, self.root)
+        self.ai_graph.build(self.graph, self.root)
+        self.dependency_graph.build(self.graph, self.root)
         self.graph.save(self.graph_path)
-        self.memory.fact("project.root", str(self.root))
-        self.memory.fact("graph.entities", len(self.graph.entities))
-        self.memory.fact("graph.relationships", len(self.graph.relationships))
-        self.memory.fact("ai.signals", ai_signals)
-        self.memory.fact("dependencies.graph", dependencies)
-        if self.memory.fact("project.initialized") is None:
-            snapshot = self.snapshotter.capture()
-            self.memory.fact("project.snapshot", snapshot.fingerprint)
-            self.memory.fact("project.inventory", self.change_analyzer.inventory(self.root))
-            self.memory.fact("project.initialized", True)
-            self.memory.remember("project_initialized", {"root": str(self.root), "entities": len(self.graph.entities), "ai_signals": len(ai_signals), "dependencies": len(dependencies), "snapshot": snapshot.fingerprint})
 
     def set_objective(self, text: str) -> Objective:
-        objective = Objective("O-" + hashlib.sha256(text.encode()).hexdigest()[:10].upper(), text)
+        objective = Objective("OBJ-" + hashlib.sha256(text.encode()).hexdigest()[:12].upper(), text, utc_now())
         self.memory.add_objective(objective)
         return objective
 
-    def proposed_objectives(self) -> list[dict]:
-        self.initialize()
-        rows = self.memory.objectives()
-        if rows:
-            return [{"id": r["id"], "text": r["text"], "source": "user"} for r in rows]
-        proposals = [(100, "Establish a security and trust-boundary baseline for the project."), (98, "Identify AI, agent, model, prompt and tool-use components and their risks."), (95, "Identify dependency and software supply-chain exposure."), (90, "Map discovered risks and evidence to applicable governance controls.")]
-        return [{"priority": p, "text": t, "source": "athena"} for p, t in proposals]
-
     def _change_classes(self) -> tuple[list[dict], set[str]]:
-        previous = self.memory.fact("project.inventory")
+        previous = self.memory.fact("project.inventory") or {}
         current = self.change_analyzer.inventory(self.root)
         previous = {k: tuple(v) if not isinstance(v, dict) else (v.get("sha256", ""), v.get("size", 0), v.get("mtime_ns", 0)) for k, v in previous.items()} if previous else {}
         changes = self.change_analyzer.compare(previous, current)
@@ -170,6 +160,11 @@ class AthenaRuntime:
         validation = self.investigator.run("Validate the current project state with available tests.", "validation", reconcile_lifecycle=False)
         findings.extend(validation.findings)
         evidence.extend(validation.evidence)
+
+        # Reconcile before reasoning so every downstream decision sees the current
+        # lifecycle state rather than the state from the previous assurance cycle.
+        lifecycle = self.lifecycle.reconcile(findings)
+
         reasoning = []
         remediation = []
         reasoning_by_id = {}
@@ -184,7 +179,6 @@ class AthenaRuntime:
                 item = self._proposal_dict(proposal)
                 remediation.append(item)
                 self.memory.remember("remediation_proposal", item)
-        lifecycle = self.lifecycle.reconcile(findings)
         decisions = self.assurance.assess(findings, reasoning_by_id)
         snapshot = self.snapshotter.capture()
         self.memory.fact("project.snapshot", snapshot.fingerprint)
