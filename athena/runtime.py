@@ -19,6 +19,7 @@ from .reasoning import ReasoningEngine
 from .remediation import SafeRemediationEngine
 from .remediation_loop import RemediationLoop
 from .snapshot import Snapshotter
+from .work import WorkQueue
 
 
 class AthenaRuntime:
@@ -41,6 +42,7 @@ class AthenaRuntime:
         self.reasoning = ReasoningEngine(self.memory)
         self.remediation = SafeRemediationEngine()
         self.remediation_loop = RemediationLoop(self.root, self.remediation)
+        self.work = WorkQueue(self.memory.db)
 
     def initialize(self) -> None:
         self.state.mkdir(parents=True, exist_ok=True)
@@ -83,12 +85,30 @@ class AthenaRuntime:
             self.memory.remember("project_drift", {"changes": [{"path": c.path, "kind": c.kind} for c in changes], "classes": sorted(classes)})
         return ([{"path": c.path, "kind": c.kind} for c in changes], classes)
 
+    def _sync_work(self, tasks, objective: str | None, changes: list[dict]) -> None:
+        """Materialize the current plan without duplicating durable work."""
+        context = hashlib.sha256(str(changes).encode()).hexdigest()[:12] if changes else "stable"
+        ids: dict[str, str] = {}
+        for task in tasks:
+            dependency_ids = tuple(ids[d] for d in task.depends_on if d in ids)
+            item = self.work.enqueue(
+                kind=task.kind,
+                reason=task.reason,
+                priority=task.priority,
+                objective=objective,
+                depends_on=dependency_ids,
+                context_key=context,
+            )
+            ids[task.kind] = item.id
+        self.memory.fact("work.pending", [item.to_dict() for item in self.work.pending()])
+
     def autonomous_plan(self):
         self.initialize()
         rows = self.memory.objectives()
         objective = Objective(rows[0]["id"], rows[0]["text"], rows[0]["status"], rows[0]["created_at"]) if rows else None
-        _, change_classes = self._change_classes()
+        changes, change_classes = self._change_classes()
         tasks = self.planner.plan(objective, self.graph, self.memory.findings(), change_classes)
+        self._sync_work(tasks, objective.text if objective else None, changes)
         self.memory.remember("plan", {"objective": objective.text if objective else None, "change_classes": sorted(change_classes), "tasks": [{"kind": t.kind, "reason": t.reason, "priority": t.priority} for t in tasks]})
         return tasks
 
@@ -109,19 +129,37 @@ class AthenaRuntime:
         self.memory.remember("inspection", {"finding_count": len(results)})
         return results
 
-    def run_autonomous_cycle(self, objective: str | None = None) -> dict:
+    def run_autonomous_cycle(self, objective: str | None = None, max_work: int = 5) -> dict:
         self.initialize()
         if objective:
             self.set_objective(objective)
         tasks = self.autonomous_plan()
-        selected = tasks[:5]
-        cycle_objective = objective or (selected[0].reason if selected else "baseline assurance")
-        _, change_classes = self._change_classes()
-        findings, evidence = [], []
-        for task in selected:
-            result = self.investigator.run(task.reason, task.kind, reconcile_lifecycle=False)
-            findings.extend(result.findings)
-            evidence.extend(result.evidence)
+        rows = self.memory.objectives()
+        active_objective = objective or (rows[0]["text"] if rows else None)
+        changes, change_classes = self._change_classes()
+        selected = []
+        for _ in range(max_work):
+            item = self.work.claim_next()
+            if item is None:
+                break
+            selected.append(item)
+            try:
+                result = self.investigator.run(item.reason, item.kind, reconcile_lifecycle=False)
+                item_result = result
+                self.work.complete(item.id)
+                self.memory.remember("work_completed", {"work_id": item.id, "kind": item.kind, "attempts": item.attempts, "findings": len(result.findings), "evidence": len(result.evidence)})
+            except Exception as exc:
+                self.work.fail(item.id, f"{type(exc).__name__}: {exc}")
+                self.memory.remember("work_failed", {"work_id": item.id, "kind": item.kind, "error": str(exc)})
+                continue
+            findings = item_result.findings
+            evidence = item_result.evidence
+            if "_findings" not in locals():
+                _findings, _evidence = [], []
+            _findings.extend(findings)
+            _evidence.extend(evidence)
+        findings = locals().get("_findings", [])
+        evidence = locals().get("_evidence", [])
         validation = self.investigator.run("Validate the current project state with available tests.", "validation", reconcile_lifecycle=False)
         findings.extend(validation.findings)
         evidence.extend(validation.evidence)
@@ -143,9 +181,20 @@ class AthenaRuntime:
         decisions = self.assurance.assess(findings, reasoning_by_id)
         snapshot = self.snapshotter.capture()
         self.memory.fact("project.snapshot", snapshot.fingerprint)
+        pending = self.work.pending()
+        self.memory.fact("work.pending", [item.to_dict() for item in pending])
+        self.memory.remember("autonomous_cycle", {"objective": active_objective, "tasks": [item.kind for item in selected], "findings": len(findings), "decisions": len(decisions), "evidence": len(evidence), "remediation_proposals": len(remediation), "lifecycle": lifecycle, "pending_work": len(pending)})
         self.graph.save(self.graph_path)
-        self.memory.remember("autonomous_cycle", {"objective": cycle_objective, "tasks": [t.kind for t in selected], "findings": len(findings), "decisions": len(decisions), "evidence": len(evidence), "remediation_proposals": len(remediation), "lifecycle": lifecycle})
-        return {"objective": cycle_objective, "plan": [{"kind": t.kind, "reason": t.reason, "priority": t.priority} for t in selected], "findings": [self._finding_dict(f) for f in findings], "reasoning": reasoning, "remediation_proposals": remediation, "decisions": [{"id": d.id, "finding_id": d.finding_id, "action": d.action.value, "approved": d.approved, "rationale": d.rationale} for d in decisions], "validation": [{"source": e.source, "kind": e.kind, "detail": e.detail} for e in validation.evidence], "snapshot": snapshot.fingerprint}
+        return {"objective": active_objective, "plan": [{"kind": t.kind, "reason": t.reason, "priority": t.priority} for t in tasks], "work": [item.to_dict() for item in selected], "pending_work": [item.to_dict() for item in pending], "findings": [self._finding_dict(f) for f in findings], "reasoning": reasoning, "remediation_proposals": remediation, "decisions": [{"id": d.id, "finding_id": d.finding_id, "action": d.action.value, "approved": d.approved, "rationale": d.rationale} for d in decisions], "validation": [{"source": e.source, "kind": e.kind, "detail": e.detail} for e in validation.evidence], "snapshot": snapshot.fingerprint}
+
+    def resume(self, max_work: int = 5) -> dict:
+        """Resume durable queued/blocked/failed work without rebuilding a new objective."""
+        self.work.resume()
+        return self.run_autonomous_cycle(max_work=max_work)
+
+    def work_status(self, include_completed: bool = False) -> list[dict]:
+        items = self.work.all() if include_completed else self.work.pending()
+        return [item.to_dict() for item in items]
 
     def remediate(self, proposal, *, approved: bool = False, validate: bool = True) -> dict:
         """Execute one previously generated proposal through the approval and validation gates."""
@@ -180,7 +229,7 @@ class AthenaRuntime:
         return {"id": finding.id, "title": finding.title, "description": finding.description, "severity": finding.severity.value, "confidence": finding.confidence, "evidence": finding.evidence, "remediation": finding.remediation, "status": finding.status}
 
     def status(self) -> dict:
-        return {"root": str(self.root), "graph_entities": len(self.graph.entities), "graph_relationships": len(self.graph.relationships), "objectives": self.memory.objectives(), "findings": self.memory.findings(), "recent_events": self.memory.recent_events()}
+        return {"root": str(self.root), "graph_entities": len(self.graph.entities), "graph_relationships": len(self.graph.relationships), "objectives": self.memory.objectives(), "findings": self.memory.findings(), "work": self.work_status(), "recent_events": self.memory.recent_events()}
 
     def close(self) -> None:
         self.memory.close()
