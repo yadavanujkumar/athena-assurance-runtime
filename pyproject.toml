@@ -31,3 +31,4 @@ addopts = "-q"
 
 [tool.ruff]
 line-length = 100
+select = ["F"]
