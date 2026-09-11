@@ -17,6 +17,7 @@ from .planner import Planner
 from .policy import Authority, PolicyEngine
 from .reasoning import ReasoningEngine
 from .remediation import SafeRemediationEngine
+from .remediation_loop import RemediationLoop
 from .snapshot import Snapshotter
 
 
@@ -39,6 +40,7 @@ class AthenaRuntime:
         self.lifecycle = FindingLifecycle(self.memory)
         self.reasoning = ReasoningEngine(self.memory)
         self.remediation = SafeRemediationEngine()
+        self.remediation_loop = RemediationLoop(self.root, self.remediation)
 
     def initialize(self) -> None:
         self.state.mkdir(parents=True, exist_ok=True)
@@ -125,9 +127,11 @@ class AthenaRuntime:
         evidence.extend(validation.evidence)
         reasoning = []
         remediation = []
+        reasoning_by_id = {}
         for finding in findings:
             self._project_finding(finding)
             context = self.reasoning.reason(finding, self.graph, change_classes=change_classes)
+            reasoning_by_id[finding.id] = context.to_dict()
             reasoning.append(context.to_dict())
             self.memory.remember("assurance_reasoning", context.to_dict())
             proposal = self.remediation.propose(self.root, finding)
@@ -136,12 +140,23 @@ class AthenaRuntime:
                 remediation.append(item)
                 self.memory.remember("remediation_proposal", item)
         lifecycle = self.lifecycle.reconcile(findings)
-        decisions = self.assurance.assess(findings)
+        decisions = self.assurance.assess(findings, reasoning_by_id)
         snapshot = self.snapshotter.capture()
         self.memory.fact("project.snapshot", snapshot.fingerprint)
         self.graph.save(self.graph_path)
         self.memory.remember("autonomous_cycle", {"objective": cycle_objective, "tasks": [t.kind for t in selected], "findings": len(findings), "decisions": len(decisions), "evidence": len(evidence), "remediation_proposals": len(remediation), "lifecycle": lifecycle})
         return {"objective": cycle_objective, "plan": [{"kind": t.kind, "reason": t.reason, "priority": t.priority} for t in selected], "findings": [self._finding_dict(f) for f in findings], "reasoning": reasoning, "remediation_proposals": remediation, "decisions": [{"id": d.id, "finding_id": d.finding_id, "action": d.action.value, "approved": d.approved, "rationale": d.rationale} for d in decisions], "validation": [{"source": e.source, "kind": e.kind, "detail": e.detail} for e in validation.evidence], "snapshot": snapshot.fingerprint}
+
+    def remediate(self, proposal, *, approved: bool = False, validate: bool = True) -> dict:
+        """Execute one previously generated proposal through the approval and validation gates."""
+        outcome = self.remediation_loop.execute(proposal, approved=approved, validate=validate)
+        payload = outcome.to_dict()
+        self.memory.remember("remediation_outcome", payload)
+        if outcome.status == "accepted":
+            self.memory.remember("project_changed", {"finding_id": proposal.finding_id, "path": proposal.path, "status": "accepted"})
+        elif outcome.status == "rolled_back":
+            self.memory.remember("project_changed", {"finding_id": proposal.finding_id, "path": proposal.path, "status": "rolled_back"})
+        return payload
 
     def _project_finding(self, finding) -> None:
         entity = self.graph.upsert_entity("finding", finding.id, name=finding.id, attributes={"finding_id": finding.id, "title": finding.title, "severity": finding.severity.value, "confidence": finding.confidence, "status": finding.status})
