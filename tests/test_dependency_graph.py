@@ -1,8 +1,6 @@
-from pathlib import Path
-
-from athena.dependencies import Advisory
 from athena.dependency_graph import DependencyGraphBuilder
 from athena.graph import KnowledgeGraph
+from athena.models import Relationship
 
 
 class StubAnalyzer:
@@ -21,7 +19,7 @@ class StubAnalyzer:
         return 80
 
 
-def test_reconcile_advisories_removes_stale_nodes_and_edges(tmp_path: Path):
+def test_reconcile_advisories_removes_stale_nodes_and_edges():
     graph = KnowledgeGraph()
     dependency = graph.upsert_entity("dependency", "python:requests", name="requests")
     advisory = graph.upsert_entity(
@@ -30,7 +28,6 @@ def test_reconcile_advisories_removes_stale_nodes_and_edges(tmp_path: Path):
         name="CVE-1",
         attributes={"ecosystem": "python", "package": "requests"},
     )
-    from athena.models import Relationship
     graph.add_relationship(Relationship(dependency.id, "affected_by", advisory.id))
 
     removed = DependencyGraphBuilder(StubAnalyzer()).reconcile_advisories(graph, "python", set())
@@ -39,7 +36,7 @@ def test_reconcile_advisories_removes_stale_nodes_and_edges(tmp_path: Path):
     assert not graph.relationships
 
 
-def test_reconcile_preserves_active_advisory(tmp_path: Path):
+def test_reconcile_preserves_active_advisory():
     graph = KnowledgeGraph()
     advisory = graph.upsert_entity(
         "advisory",
