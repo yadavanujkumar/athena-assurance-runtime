@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
@@ -34,6 +34,9 @@ class Entity:
     path: str | None = None
     attributes: dict[str, Any] = field(default_factory=dict)
 
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
 
 @dataclass(slots=True)
 class Relationship:
@@ -41,6 +44,9 @@ class Relationship:
     relation: str
     target: str
     attributes: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(slots=True)
@@ -55,6 +61,11 @@ class Finding:
     status: str = "open"
     created_at: str = field(default_factory=utc_now)
 
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["severity"] = self.severity.value
+        return data
+
 
 @dataclass(slots=True)
 class Objective:
@@ -62,6 +73,9 @@ class Objective:
     text: str
     status: str = "active"
     created_at: str = field(default_factory=utc_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(slots=True)
@@ -72,3 +86,8 @@ class Decision:
     approved: bool
     rationale: str
     created_at: str = field(default_factory=utc_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["action"] = self.action.value
+        return data
