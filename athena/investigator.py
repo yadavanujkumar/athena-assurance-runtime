@@ -7,12 +7,12 @@ from .detectors import default_detectors
 from .evidence import Evidence, EvidenceLedger
 from .governance import GovernanceCatalog
 from .inspectors import ProjectInspector
-from .models import Finding, Severity
+from .models import Finding
 from .risk import RiskEngine
 
 
 class Investigator:
-    """Executes bounded, read-only investigations and converts observations into evidence."""
+    """Executes bounded, read-only investigations and records their evidence."""
 
     def __init__(self, root: Path, graph, memory) -> None:
         self.root = root
@@ -24,11 +24,13 @@ class Investigator:
 
     def run(self, task_kind: str) -> dict:
         if task_kind in {"architecture_review", "dependency_review", "ai_system_review"}:
-            inspection = ProjectInspector(self.root, self.graph).inspect()
-            for item in inspection:
-                self.ledger.add(Evidence(item["id"], "project_signal", "project_inspector", str(item), 0.9))
-            self.memory.remember("evidence", {"task": task_kind, "items": self.ledger.to_dict()})
-            return {"task": task_kind, "evidence": self.ledger.to_dict()}
+            findings = ProjectInspector().inspect(self.root, self.graph)
+            for finding in findings:
+                self.ledger.add(Evidence(f"E-{finding.id}", "project_signal", "project_inspector", finding.description, finding.confidence))
+                self.memory.add_finding(finding)
+            result = {"task": task_kind, "findings": [f.id for f in findings], "evidence": self.ledger.to_dict()}
+            self.memory.remember("evidence", result)
+            return result
 
         if task_kind in {"security_review", "finding_triage"}:
             findings: list[Finding] = []
@@ -40,19 +42,21 @@ class Investigator:
                 controls = self.governance.map_finding(finding)
                 self.memory.add_finding(finding)
                 output.append({"finding": finding.id, "risk": risk.score, "band": risk.band, "controls": controls})
-                self.ledger.add(Evidence(f"E-{finding.id}", "finding", detector.name, finding.description, finding.confidence))
-            self.memory.remember("investigation", {"task": task_kind, "results": output})
-            return {"task": task_kind, "results": output, "evidence": self.ledger.to_dict()}
+                self.ledger.add(Evidence(f"E-{finding.id}", "finding", "detector", finding.description, finding.confidence))
+            result = {"task": task_kind, "results": output, "evidence": self.ledger.to_dict()}
+            self.memory.remember("investigation", result)
+            return result
 
         if task_kind == "governance_review":
-            controls = [c.__dict__ if hasattr(c, "__dict__") else {"framework": c.framework, "control_id": c.control_id, "title": c.title, "intent": c.intent} for c in self.governance.controls()]
-            self.memory.remember("governance_catalog_review", {"controls": controls})
-            return {"task": task_kind, "controls": controls}
+            controls = [c.to_dict() for c in self.governance.controls()]
+            result = {"task": task_kind, "controls": controls}
+            self.memory.remember("governance_catalog_review", result)
+            return result
 
         if task_kind == "evidence_validation":
-            result = self._git_context()
+            result = {"task": task_kind, "git": self._git_context()}
             self.memory.remember("validation", result)
-            return {"task": task_kind, "git": result}
+            return result
 
         if task_kind == "scope_objective":
             return {"task": task_kind, "status": "scoped"}
@@ -61,7 +65,13 @@ class Investigator:
     def _git_context(self) -> dict:
         def git(*args: str) -> str:
             try:
-                return subprocess.run(["git", *args], cwd=self.root, text=True, capture_output=True, timeout=10, check=False).stdout.strip()
+                completed = subprocess.run(["git", *args], cwd=self.root, text=True, capture_output=True, timeout=10, check=False)
+                return completed.stdout.strip()
             except (OSError, subprocess.SubprocessError):
                 return ""
-        return {"branch": git("branch", "--show-current"), "head": git("rev-parse", "HEAD"), "status": git("status", "--short"), "recent_commits": git("log", "-5", "--oneline")}
+        return {
+            "branch": git("branch", "--show-current"),
+            "head": git("rev-parse", "HEAD"),
+            "status": git("status", "--short"),
+            "recent_commits": git("log", "-5", "--oneline"),
+        }
