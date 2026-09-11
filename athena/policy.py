@@ -18,7 +18,7 @@ class Authority:
 
 
 class PolicyEngine:
-    """Maps risk to a bounded action without silently granting write authority."""
+    """Enforces an explicit autonomy boundary; no write authority is implicit."""
 
     def __init__(self, authority: Authority | None = None) -> None:
         self.authority = authority or Authority()
@@ -29,3 +29,6 @@ class PolicyEngine:
         if finding.severity in {Severity.HIGH, Severity.CRITICAL}:
             return Action.MODIFY if self.authority.modify else Action.RECOMMEND
         return Action.RECOMMEND
+
+    def can_execute(self, action: Action) -> bool:
+        return self.authority.allowed(action)
