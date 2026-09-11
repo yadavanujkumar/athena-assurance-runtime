@@ -121,6 +121,22 @@ class WorkQueue:
         self.db.commit()
         return self.get(item_id)  # type: ignore[return-value]
 
+    def cancel(self, item_id: str, reason: str) -> WorkItem | None:
+        """Cancel queued/blocked work that is no longer justified by current evidence."""
+        self.db.execute("UPDATE work_items SET status='cancelled', last_error=?, updated_at=? WHERE id=? AND status IN ('queued','blocked')", (reason[:2000], utc_now(), item_id))
+        self.db.commit()
+        return self.get(item_id)
+
+    def cancel_stale_contexts(self, *, kind: str, context_prefix: str, active_contexts: set[str], reason: str) -> list[WorkItem]:
+        rows = self.db.execute("SELECT id, context_key FROM work_items WHERE kind=? AND status IN ('queued','blocked') AND context_key LIKE ?", (kind, context_prefix + "%")).fetchall()
+        cancelled: list[WorkItem] = []
+        for row in rows:
+            if row["context_key"] not in active_contexts:
+                item = self.cancel(row["id"], reason)
+                if item:
+                    cancelled.append(item)
+        return cancelled
+
     def resume(self, item_id: str | None = None) -> list[WorkItem]:
         if item_id:
             self.db.execute("UPDATE work_items SET status='queued', last_error=NULL, updated_at=? WHERE id=? AND status IN ('blocked','failed')", (utc_now(), item_id))
