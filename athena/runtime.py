@@ -115,10 +115,37 @@ class AthenaRuntime:
         self.memory.fact("dependencies.advisories", advisories)
         return advisories
 
+    def _sync_advisory_work(self, objective: str | None) -> list:
+        """Turn active high-risk advisory graph nodes into durable, bounded review work."""
+        active_contexts: set[str] = set()
+        created = []
+        for entity in self.graph.entities.values():
+            if entity.kind != "advisory":
+                continue
+            risk = float(entity.attributes.get("risk", 0))
+            if risk < 80:
+                continue
+            advisory_id = entity.id
+            ecosystem = str(entity.attributes.get("ecosystem", "unknown"))
+            package = str(entity.attributes.get("package", entity.name or "unknown"))
+            identifiers = entity.attributes.get("identifiers", [])
+            fixed = entity.attributes.get("fixed_version") or "unknown"
+            vulnerable = entity.attributes.get("vulnerable_range") or "unknown"
+            context_key = "advisory:" + advisory_id
+            active_contexts.add(context_key)
+            reason = f"Review active {ecosystem} advisory for {package}; risk={risk:.0f}; identifiers={identifiers}; vulnerable_range={vulnerable}; fixed_version={fixed}. Confirm impact, upgrade/remediation path, and rerun dependency audit."
+            created.append(self.work.enqueue(kind="dependency_advisory_review", reason=reason, priority=130 if risk >= 100 else 125, objective=objective, context_key=context_key))
+        self.work.cancel_stale_contexts(kind="dependency_advisory_review", context_prefix="advisory:", active_contexts=active_contexts, reason="Advisory is no longer present in the latest successful dependency audit.")
+        if created:
+            self.memory.remember("advisory_work_synced", {"count": len(created), "work_ids": [item.id for item in created]})
+        return created
+
     def run_autonomous_cycle(self, objective: str | None = None, max_work: int = 5) -> dict:
         self.initialize()
         if objective:
             self.set_objective(objective)
+        self._refresh_dependency_advisories()
+        advisory_work = self._sync_advisory_work(objective or self._active_objective())
         tasks = self.autonomous_plan()
         rows = self.memory.objectives()
         active_objective = objective or (rows[0]["text"] if rows else None)
@@ -141,7 +168,6 @@ class AthenaRuntime:
             except Exception as exc:
                 self.work.fail(work_item.id, f"{type(exc).__name__}: {exc}")
                 self.memory.remember("work_failed", {"work_id": work_item.id, "kind": work_item.kind, "error": str(exc)})
-        self._refresh_dependency_advisories()
         validation = self.investigator.run("Validate the current project state with available tests.", "validation", reconcile_lifecycle=False)
         findings.extend(validation.findings)
         evidence.extend(validation.evidence)
@@ -165,7 +191,7 @@ class AthenaRuntime:
         self.memory.fact("project.snapshot", snapshot.fingerprint)
         pending = self.work.pending()
         self.memory.fact("work.pending", [item.to_dict() for item in pending])
-        self.memory.remember("autonomous_cycle", {"objective": active_objective, "tasks": [item.kind for item in selected], "findings": len(findings), "decisions": len(decisions), "evidence": len(evidence), "remediation_proposals": len(remediation), "lifecycle": lifecycle, "pending_work": len(pending)})
+        self.memory.remember("autonomous_cycle", {"objective": active_objective, "tasks": [item.kind for item in selected], "advisory_work": [item.id for item in advisory_work], "findings": len(findings), "decisions": len(decisions), "evidence": len(evidence), "remediation_proposals": len(remediation), "lifecycle": lifecycle, "pending_work": len(pending)})
         self.graph.save(self.graph_path)
         return {"objective": active_objective, "plan": [{"kind": t.kind, "reason": t.reason, "priority": t.priority} for t in tasks], "work": [item.to_dict() for item in selected], "pending_work": [item.to_dict() for item in pending], "findings": [self._finding_dict(f) for f in findings], "reasoning": reasoning, "remediation_proposals": remediation, "decisions": [{"id": d.id, "finding_id": d.finding_id, "action": d.action.value, "approved": d.approved, "rationale": d.rationale} for d in decisions], "validation": [{"source": e.source, "kind": e.kind, "detail": e.detail} for e in validation.evidence], "snapshot": snapshot.fingerprint}
 
