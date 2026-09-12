@@ -27,8 +27,11 @@ class ValidationEngine:
         "go test", "cargo test", "mvn test", "gradle test",
     )
 
-    def detect_commands(self, root: str | Path) -> list[str]:
-        root = Path(root).resolve()
+    def __init__(self, root: str | Path | None = None) -> None:
+        self.root = Path(root).resolve() if root is not None else None
+
+    def detect_commands(self, root: str | Path | None = None) -> list[str]:
+        root = self._root(root)
         commands: list[str] = []
         if (root / "pytest.ini").exists() or (root / "tests").is_dir() or (root / "pyproject.toml").exists():
             commands.append("python -m pytest")
@@ -44,15 +47,19 @@ class ValidationEngine:
             commands.append("gradle test")
         return list(dict.fromkeys(commands))
 
-    def run(self, root: str | Path, command: str, timeout: int = 120) -> ValidationResult:
+    def run(self, root: str | Path | None, command: str, timeout: int = 120) -> ValidationResult:
         if not self._allowed(command):
             return ValidationResult(command, False, None, False, stderr="Command is outside ATHENA's read-only validation allowlist.")
         try:
             parts = shlex.split(command)
-            completed = subprocess.run(parts, cwd=Path(root).resolve(), text=True, capture_output=True, timeout=timeout, check=False)
+            completed = subprocess.run(parts, cwd=self._root(root), text=True, capture_output=True, timeout=timeout, check=False)
         except (OSError, subprocess.SubprocessError) as exc:
             return ValidationResult(command, False, None, False, stderr=str(exc))
         return ValidationResult(command, True, completed.returncode, completed.returncode == 0, completed.stdout[-12000:], completed.stderr[-12000:])
+
+    def _root(self, root: str | Path | None) -> Path:
+        selected = root if root is not None else self.root
+        return Path(selected or ".").resolve()
 
     @classmethod
     def _allowed(cls, command: str) -> bool:
