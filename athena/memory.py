@@ -126,3 +126,7 @@ class Memory:
 
     def close(self) -> None:
         self.db.close()
+
+
+# Backward-compatible name used by the runtime and existing integrations.
+MemoryStore = Memory
