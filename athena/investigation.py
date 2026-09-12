@@ -33,6 +33,10 @@ class InvestigationEngine:
 
     def __init__(self, root: Path, memory, governance=None) -> None:
         self.root = root
+        # Older runtime callers passed (root, graph, memory). Preserve that API
+        # while keeping the current (root, memory, governance) form supported.
+        if governance is not None and hasattr(governance, "fact") and not hasattr(memory, "fact"):
+            memory, governance = governance, None
         self.memory = memory
         self.governance = governance
         self.dependencies = DependencyAnalyzer()
