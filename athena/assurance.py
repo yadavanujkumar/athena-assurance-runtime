@@ -46,14 +46,14 @@ class AssuranceEngine:
         lifecycle = str((context.get("lifecycle") or {}).get("state", "new")).lower()
         if lifecycle == "resolved":
             return Action.OBSERVE if self.policy.can_execute(Action.OBSERVE) else action
+        if band == "critical" and self.policy.authority.block and self.policy.can_execute(Action.BLOCK):
+            return Action.BLOCK
         if lifecycle in {"reopened", "worsening"} and band in {"critical", "high"}:
             if self.policy.can_execute(Action.INVESTIGATE):
                 return Action.INVESTIGATE
         if lifecycle == "new" and band in {"critical", "high"}:
             if self.policy.can_execute(Action.INVESTIGATE):
                 return Action.INVESTIGATE
-        if band == "critical" and self.policy.authority.block:
-            return Action.BLOCK
         if band in {"critical", "high"} and self.policy.authority.modify and action is Action.RECOMMEND:
             return Action.MODIFY
         return action
