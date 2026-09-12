@@ -49,33 +49,40 @@ class AuditResult:
 class DependencyAnalyzer:
     """Read manifests and normalize optional open-source supply-chain advisories."""
 
-    def inventory(self, root: str | Path) -> list[Dependency]:
-        root = Path(root).resolve()
+    def __init__(self, root: str | Path | None = None) -> None:
+        self.root = Path(root).resolve() if root is not None else None
+
+    def inventory(self, root: str | Path | None = None) -> list[Dependency]:
+        project_root = self._root(root)
         result: list[Dependency] = []
-        result.extend(self._requirements(root / "requirements.txt"))
-        result.extend(self._pyproject(root / "pyproject.toml"))
-        result.extend(self._package_json(root / "package.json"))
-        result.extend(self._go_mod(root / "go.mod"))
+        result.extend(self._requirements(project_root / "requirements.txt"))
+        result.extend(self._pyproject(project_root / "pyproject.toml"))
+        result.extend(self._package_json(project_root / "package.json"))
+        result.extend(self._go_mod(project_root / "go.mod"))
         return result
 
-    def audit(self, root: str | Path, ecosystem: str) -> AuditResult:
-        root = Path(root).resolve()
+    def audit(self, root: str | Path | None, ecosystem: str) -> AuditResult:
+        project_root = self._root(root)
         commands = {"python": ["python", "-m", "pip_audit", "-f", "json"], "node": ["npm", "audit", "--json"]}
         command = commands.get(ecosystem)
         if command is None:
             return AuditResult(ecosystem, False, None, [], "No built-in auditor for this ecosystem.")
         try:
-            completed = subprocess.run(command, cwd=root, text=True, capture_output=True, timeout=120, check=False)
+            completed = subprocess.run(command, cwd=project_root, text=True, capture_output=True, timeout=120, check=False)
         except (OSError, subprocess.SubprocessError) as exc:
             return AuditResult(command[0], False, None, [], str(exc))
         output = completed.stdout or completed.stderr
         findings = self._parse_audit(output, ecosystem)
         return AuditResult(command[0], True, completed.returncode, findings, output[:12000])
 
-    def advisories(self, root: str | Path, ecosystem: str) -> list[Advisory]:
+    def advisories(self, root: str | Path | None, ecosystem: str) -> list[Advisory]:
         """Run an installed auditor and convert results into stable advisory records."""
         result = self.audit(root, ecosystem)
         return self.normalize_advisories(result.findings, ecosystem, result.tool)
+
+    def _root(self, root: str | Path | None) -> Path:
+        selected = root if root is not None else self.root
+        return Path(selected or ".").resolve()
 
     @staticmethod
     def normalize_advisories(findings: list[dict], ecosystem: str, source: str) -> list[Advisory]:
