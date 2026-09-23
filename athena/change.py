@@ -27,6 +27,9 @@ class ChangeAnalyzer:
 
     IGNORED = {".git", ".athena", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache"}
 
+    def __init__(self, root: str | Path | None = None) -> None:
+        self._root = Path(root).resolve() if root is not None else None
+
     def inventory(self, root: str | Path) -> dict[str, FileFingerprint]:
         root = Path(root).resolve()
         result: dict[str, FileFingerprint] = {}

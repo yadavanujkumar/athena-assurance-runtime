@@ -16,10 +16,10 @@ from .graph import ProjectGraph, Relationship
 from .investigation import Investigator
 from .lifecycle import FindingLifecycle
 from .memory import MemoryStore
-from .models import Finding, Objective, utc_now
+from .models import Objective, utc_now
 from .planner import Planner
 from .policy import Authority, PolicyEngine
-from .remediation import RemediationPlanner
+from .remediation import RemediationPlanner, SafeRemediationEngine
 from .remediation_loop import RemediationLoop
 from .reasoning import ReasoningEngine
 from .snapshot import Snapshotter
@@ -53,7 +53,8 @@ class AthenaRuntime:
         self.policy = PolicyEngine(authority or configured_authority)
         self.assurance = AssuranceEngine(self.memory, self.policy)
         self.remediation = RemediationPlanner()
-        self.remediation_loop = RemediationLoop(self.root, self.validation)
+        self.patch_engine = SafeRemediationEngine()
+        self.remediation_loop = RemediationLoop(self.root, validation=self.validation)
         self.change_analyzer = ChangeAnalyzer(root)
         self.snapshotter = Snapshotter(root)
         self.evidence = EvidenceLedger()
@@ -62,7 +63,10 @@ class AthenaRuntime:
         self.leases = WorkLeaseStore(self.memory.db, owner=self.worker_id)
 
     def initialize(self) -> None:
-        self.graph.load(self.graph_path)
+        loaded = ProjectGraph.load(self.graph_path)
+        self.graph.entities.update(loaded.entities)
+        for rel in loaded.relationships:
+            self.graph.add_relationship(rel)
         self.graph.discover_project(self.root)
         self.ai_graph.build(self.graph, self.root)
         self.dependency_graph.build(self.graph, self.root)
@@ -185,7 +189,7 @@ class AthenaRuntime:
             reasoning_by_id[finding.id] = context.to_dict()
             reasoning.append(context.to_dict())
             self.memory.remember("assurance_reasoning", context.to_dict())
-            proposal = self.remediation.propose(self.root, finding)
+            proposal = self.patch_engine.propose(self.root, finding)
             if proposal:
                 item = self._proposal_dict(proposal)
                 remediation.append(item)

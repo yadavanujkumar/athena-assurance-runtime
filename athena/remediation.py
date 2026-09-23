@@ -116,11 +116,14 @@ class SafeRemediationEngine:
 
     @classmethod
     def _atomic_write(cls, path: Path, content: str) -> None:
+        import sys
         mode = path.stat().st_mode & 0o777
         fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.athena-", dir=path.parent)
         temporary_path = Path(temporary)
         try:
-            os.fchmod(fd, mode)
+            # fchmod is not available on Windows; skip permission copy there.
+            if sys.platform != "win32":
+                os.fchmod(fd, mode)
             with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
                 handle.write(content)
                 handle.flush()

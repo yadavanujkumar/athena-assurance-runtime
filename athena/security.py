@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import stat
 from pathlib import Path
 
@@ -38,9 +37,19 @@ def secure_file_mode(path: Path) -> int | None:
 
 
 def has_safe_permissions(path: Path) -> bool:
-    """Reject world/group-writable project files from privileged modification."""
+    """Reject world/group-writable project files from privileged modification.
+
+    On Windows the Unix group/other write bits are not meaningful. The function
+    returns True for any existing regular file on Windows since ACLs govern access
+    there rather than mode bits.
+    """
+    import sys
     try:
         mode = path.stat().st_mode
     except OSError:
         return False
+    if sys.platform == "win32":
+        # On Windows all regular files appear world-writable via Unix mode bits;
+        # skip the group/other check and rely on the OS ACL model instead.
+        return stat.S_ISREG(mode)
     return not bool(mode & (stat.S_IWGRP | stat.S_IWOTH))
